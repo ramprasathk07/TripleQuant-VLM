@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────
+# base.yaml  –  shared hyper-parameters for TripleQuant-VLM
+# ─────────────────────────────────────────────────────────────
+
+model:
+  model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
+  torch_dtype: "bfloat16"
+  device_map: "auto"
+  trust_remote_code: true
+
+calibration:
+  dataset_id: "neuralmagic/calibration"
+  dataset_name: "LLM"
+  dataset_split: "train"
+  num_samples: 256
+  max_seq_length: 4096
+  seed: 42
+
+output:
+  base_dir: "outputs"
+  save_compressed: true
+  save_dir_suffix: "-quantized"
+
+benchmark:
+  sample_prompts:
+    - "Describe what you see in this image."
+    - "What is the capital of France?"
+  max_new_tokens: 64
+  warmup_runs: 2
+  timed_runs: 3

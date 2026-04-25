@@ -1,0 +1,11 @@
+# Model definition
+model:
+  model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
+  torch_dtype: "bfloat16"
+  device_map: "auto"
+  trust_remote_code: true
+  min_pixels: 100352 # 128 * 28 * 28
+  max_pixels: 200704 # 256 * 28 * 28
+
+output:
+  base_dir: "outputs"
