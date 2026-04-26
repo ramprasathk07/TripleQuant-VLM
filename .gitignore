@@ -6,7 +6,7 @@ __pycache__/
 # C extensions
 *.so
 .venv/
-
+implementation_planTTTQUANt
 # Distribution / packaging
 .Python
 build/
@@ -206,3 +206,21 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ── TripleQuant-VLM project-specific ────────────────────────────────────────
+
+# Quantized model weights (large binary files)
+outputs/
+
+# Benchmark results (generated at runtime)
+results/
+
+# HuggingFace model / dataset cache
+.cache/
+models/hub/
+
+# Accidental pip output files
+=*
+
+# Wandb / experiment tracking
+wandb/

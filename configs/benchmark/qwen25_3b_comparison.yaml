@@ -1,0 +1,41 @@
+# Models to benchmark sequentially (FP16 baseline → quantized variants)
+models:
+  - name: "FP16 Baseline"
+    path: "Qwen/Qwen2.5-3B-Instruct"
+    is_local: false
+    gpu_memory_utilization: 0.85
+    max_model_len: 4096
+
+  - name: "AWQ W4A16"
+    path: "outputs/Qwen2.5-3B-Instruct-AWQ-W4A16"
+    is_local: true
+    gpu_memory_utilization: 0.85
+    max_model_len: 4096
+
+  - name: "GPTQ W8A16"
+    path: "outputs/Qwen2.5-3B-Instruct-GPTQ-W8A16"
+    is_local: true
+    gpu_memory_utilization: 0.85
+    max_model_len: 4096
+
+# Evaluation dataset
+dataset:
+  dataset_id: "wikitext"
+  dataset_subset: "wikitext-2-raw-v1"
+  dataset_split: "test"
+  num_samples: 50
+  prompts:
+    - "Summarize this text in 3 sentences."
+    - "What are the key takeaways from this passage?"
+
+# Metrics to collect
+metrics:
+  latency: true
+  accuracy: true
+  memory: true
+  perplexity: false
+  warmup_runs: 2
+  timed_runs: 5
+  max_new_tokens: 512
+
+results_dir: "results"

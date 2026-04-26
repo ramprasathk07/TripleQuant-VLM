@@ -1,0 +1,36 @@
+# ── Model ──────────────────────────────────────────────────────────────────
+model:
+  model_id: "Qwen/Qwen2.5-3B-Instruct"
+  torch_dtype: "bfloat16"
+  device_map: "auto"
+  trust_remote_code: true
+
+# ── Quantization Method ─────────────────────────────────────────────────────
+quantization:
+  method: "awq"
+  num_bits: 4
+  group_size: 128
+  symmetric: true
+  targets: ["Linear"]
+  ignore:
+    - "re:.*embed_tokens"
+    - "re:.*norm$"
+    - "re:.*layernorm$"
+    - "lm_head"
+  awq:
+    duo_scaling: false
+
+# ── Calibration ─────────────────────────────────────────────────────────────
+calibration:
+  dataset_id: "wikitext"
+  dataset_subset: "wikitext-2-raw-v1"
+  dataset_split: "train"
+  num_samples: 64
+  max_seq_length: 512
+  batch_size: 1
+
+# ── Output ──────────────────────────────────────────────────────────────────
+output:
+  base_dir: "outputs"
+  save_compressed: true
+  save_dir_suffix: "-AWQ-W4A16"
