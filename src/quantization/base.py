@@ -40,7 +40,7 @@ class BaseQuantizer(ABC):
         logger.info("Loading model: %s (dtype=%s, device_map=%s)",
                     self.model_id, self.config.model.torch_dtype, self.device_map)
 
-        is_vlm = "VL" in self.model_id or "vision" in self.model_id.lower()
+        is_vlm = self.model.model_type
 
         if is_vlm:
             self._load_vlm()

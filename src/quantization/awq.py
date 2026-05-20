@@ -35,3 +35,4 @@ class AWQQuantizer(BaseQuantizer):
             return self.model.config.language_config.num_hidden_layers
         
     
+    
