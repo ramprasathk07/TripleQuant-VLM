@@ -1,0 +1,49 @@
+method: gptq
+backend: llm_compressor
+
+model:
+  model_id: Qwen/Qwen2.5-VL-3B-Instruct   # 3B parameters
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: true
+  model_type: vlm
+  modality: vision
+  min_pixels: 3136      # 4 * 28 * 28
+  max_pixels: 200704    # 256 * 28 * 28 — fits 12GB VRAM
+
+scheme:
+  scheme: W4A16                         # 4‑bit weights, 16‑bit activations
+  group_size: 128
+  symmetric: true
+  actorder: true
+  observer: mse
+  per_channel: false
+  targets: ["Linear"]
+  ignore:
+    - lm_head
+    - re:.*visual.*
+    - re:.*vision_tower.*
+    - re:.*mm_projector.*
+    - re:.*multi_modal_projector.*
+    - re:.*merger.*
+
+calibration:
+  dataset_name: linxy/LaTeX_OCR
+  split: train
+  num_samples: 8
+  max_seq_len: 1024
+  image_field: image
+  text_field: text
+  seed: 42
+
+output:
+  output_dir: ./qwen2.5vl-gptq-w4a16-llmcompressor
+  save_compressed: true
+  save_processor: true
+
+smoothquant:
+  enabled: false                        # Not needed when activations stay at 16‑bit
+
+gptq:
+  dampening_frac: 0.01
+  # sequential_update: true

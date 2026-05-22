@@ -1,0 +1,51 @@
+method: gptq
+backend: llm_compressor
+
+model:
+  model_id: HuggingFaceTB/SmolVLM2-2.2B-Instruct   # 2.2B parameters
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: true
+  model_type: vlm
+  modality: vision_text
+  min_pixels: 3136      # 4 * 28 * 28
+  max_pixels: 200704    # 256 * 28 * 28 — fits 12GB VRAM
+
+scheme:
+  scheme: W4A16
+  group_size: 128
+  symmetric: true
+  actorder: true
+  observer: mse
+  per_channel: false
+  targets: ["Linear"]
+  ignore:
+    - lm_head
+    - re:.*vision_model.*
+    - re:.*visual.*
+    - re:.*vit.*
+    - re:.*mm_projector.*
+    - re:.*multi_modal_projector.*
+    - re:.*merger.*
+    - re:.*patch_embed.*
+
+calibration:
+  dataset_name: HuggingFaceM4/TextOCR
+  split: train
+  num_samples: 256
+  max_seq_len: 1024
+  image_field: image
+  text_field: text
+  seed: 42
+
+output:
+  output_dir: ./smolvlm2-gptq-w4a16-llmcompressor
+  save_compressed: true
+  save_processor: true
+
+smoothquant:
+  enabled: false
+
+gptq:
+  dampening_frac: 0.01
+  sequential_update: true

@@ -1,121 +1,70 @@
 #!/usr/bin/env python
+# quantize.py - Main entry point for model quantization
 """
-quantize.py — TripleQuant-VLM quantization entry point.
-
 Usage:
-    python quantize.py --config configs/quantize/qwen25vl_3b_awq.yaml
-    python quantize.py --config configs/quantize/qwen25vl_3b_awq.yaml --dry-run
+    python quantize.py --config path/to/config.yaml
 """
+
 from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
+from pathlib import Path
 
-# ── Logging setup (before any project imports so all loggers inherit) ────────
+import yaml
+from src.config.schemas import QuantizeConfig
+from src.quantization.factory import get_quantizer
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("quantize")
-
-# Config layer only — no torch / llmcompressor dependency at import time
-from src.config import load_quantize_config
+logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="TripleQuant-VLM — Quantize a vision-language model.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Supported methods: awq, gptq",
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Quantize a model using a YAML configuration.")
     parser.add_argument(
-        "--config", required=True,
-        help="Path to a quantize YAML config (e.g. configs/quantize/qwen25vl_3b_awq.yaml)",
+        "--config", "-c",
+        type=Path,
+        required=True,
+        help="Path to the quantization config YAML file."
     )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Validate config and print the execution plan without loading the model.",
-    )
-    return parser.parse_args()
+    args = parser.parse_args()
 
-
-def main() -> None:
-    args = parse_args()
-
-    # ── 1. Load + validate config (lightweight — no GPU) ────────────────────
-    logger.info("Loading config: %s", args.config)
-    try:
-        config = load_quantize_config(args.config)
-    except (FileNotFoundError, ValueError) as exc:
-        logger.error("%s", exc)
+    # Load YAML config
+    if not args.config.exists():
+        logger.error("Config file not found: %s", args.config)
         sys.exit(1)
 
-    method = config.quantization.method
-    model_id = config.model.model_id
-    suffix = config.output.save_dir_suffix
-    save_name = model_id.split("/")[-1] + suffix
-    output_dir = os.path.join(config.output.base_dir, save_name)
+    with open(args.config, "r", encoding="utf-8") as f:
+        config_dict = yaml.safe_load(f)
 
-    logger.info("─" * 60)
-    logger.info("Quantization plan:")
-    logger.info("  Model        : %s", model_id)
-    logger.info("  Method       : %s (W%dA16)", method.upper(), config.quantization.num_bits)
-    logger.info("  Calib dataset: %s  [%d samples]",
-                config.calibration.dataset_id, config.calibration.num_samples)
-    logger.info("  Output dir   : %s", output_dir)
-    logger.info("─" * 60)
-
-    if args.dry_run:
-        logger.info("--dry-run: stopping before model load. Config is valid ✓")
-        return
-
-    # ── 2. Import heavy ML stack (torch / llmcompressor) only when needed ────
-    import src.quantization  # noqa: F401 — triggers @register decorators
-    from src.quantization.registry import get_quantizer_class
-
+    # Validate and create config object
     try:
-        QuantizerClass = get_quantizer_class(method)
-    except KeyError as exc:
-        logger.error("%s", exc)
+        config = QuantizeConfig.model_validate(config_dict)
+    except Exception as e:
+        logger.error("Invalid configuration: %s", e)
         sys.exit(1)
 
-    quantizer = QuantizerClass(config)
+    # Log the chosen backend and method
+    logger.info("Using backend: %s, method: %s", config.backend, config.method)
 
-    # ── 3. Load model ────────────────────────────────────────────────────────
+    # Instantiate the appropriate quantizer (model not yet loaded)
+    quantizer = get_quantizer(config)
+
+    # Load model (and processor/tokenizer) from HuggingFace
+    logger.info("Loading model: %s", config.model.model_id)
     quantizer.load_model()
 
-    # ── 4. Build calibration dataset ─────────────────────────────────────────
-    logger.info("Building calibration dataset from: %s", config.calibration.dataset_id)
-    from src.data.processors import get_vlm_dataset, get_llm_dataset
+    # Run quantization
+    logger.info("Starting quantization...")
+    quantizer.quantize()
 
-    if quantizer.processor is not None:
-        dataset = get_vlm_dataset(
-            dataset_id=config.calibration.dataset_id,
-            processor=quantizer.processor,
-            split=config.calibration.dataset_split,
-            num_samples=config.calibration.num_samples,
-        )
-    else:
-        dataset = get_llm_dataset(
-            dataset_id=config.calibration.dataset_id,
-            tokenizer=quantizer.tokenizer,
-            dataset_subset=config.calibration.dataset_subset,
-            split=config.calibration.dataset_split,
-            num_samples=config.calibration.num_samples,
-        )
-
-    # ── 5. Quantize + save ───────────────────────────────────────────────────
-    os.makedirs(config.output.base_dir, exist_ok=True)
-    quantizer.quantize(dataset, output_dir=output_dir)
-
-    # Save the model and processor/tokenizer explicitly
-    # Moving to CPU inside save() avoids accelerate/transformers offload KeyErrors
-    quantizer.save(output_dir, weights=True)
-
-    logger.info("✅ Quantization complete → %s", output_dir)
+    logger.info("Quantization completed successfully. Output saved to: %s", config.output.output_dir)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,43 @@
+method: awq
+backend: modelopt
+
+model:
+  model_id: Qwen/Qwen2.5-VL-7B-Instruct
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: true
+  model_type: vlm
+  modality: vision_text
+  min_pixels: 3136      # 4 * 28 * 28
+  max_pixels: 200704    # 256 * 28 * 28 — fits 12GB VRAM
+
+scheme:
+  scheme: W4A16
+  group_size: 64
+  symmetric: true
+  actorder: true          # will be used by AWQ modifier
+  observer: percentile    # reduces outlier impact
+  per_channel: false      # keep per‑group for compression; set true for max quality
+  dynamic_activations: false
+  targets: ["Linear"]
+  ignore:
+    - lm_head
+
+calibration:
+  dataset_name: HuggingFaceM4/TextOCR
+  num_samples: 1024
+  max_seq_len: 2048
+  image_field: image
+  text_field: text
+  seed: 42
+
+output:
+  output_dir: ./qwen2.5vl-awq-w4a16-modelopt-ultimate
+  save_compressed: true
+  save_processor: true
+
+smoothquant:
+  enabled: false
+
+awq:
+  duo_scaling: true

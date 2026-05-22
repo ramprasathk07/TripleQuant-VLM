@@ -6,6 +6,8 @@ __pycache__/
 # C extensions
 *.so
 .venv/
+*.bat 
+
 implementation_planTTTQUANt
 # Distribution / packaging
 .Python
@@ -75,6 +77,8 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+outputs/
+.venv_312/
 
 # Jupyter Notebook
 .ipynb_checkpoints

@@ -1,0 +1,42 @@
+method: gptq
+backend: llm_compressor
+
+model:
+  model_id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  model_type: llm
+  modality: text
+
+scheme:
+  scheme: W8A8
+  group_size: 128
+  symmetric: true
+  actorder: true
+  observer: mse
+  per_channel: false
+  targets: ["Linear"]
+  ignore:
+    - lm_head
+
+calibration:
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  num_samples: 8
+  max_seq_len: 1024
+  seed: 42
+
+output:
+  output_dir: ./tinyllama-1b-awq-llmcompressor
+  save_compressed: true
+  save_processor: true
+
+smoothquant:
+  enabled: true
+  strength: 0.5
+  mappings:
+    - [["re:.*q_proj", "re:.*k_proj", "re:.*v_proj"], "re:.*input_layernorm"]
+    - [["re:.*gate_proj", "re:.*up_proj"], "re:.*post_attention_layernorm"]
+awq:
+  duo_scaling: true

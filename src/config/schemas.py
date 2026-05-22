@@ -1,73 +1,189 @@
 """
-Pydantic v2 schemas for all TripleQuant-VLM config files.
+config/schemas.py — Pydantic v2 schemas for TripleQuant-VLM.
+Single source of truth for all configuration.
 """
 from __future__ import annotations
 
-from typing import Literal, Optional
-from pydantic import BaseModel, Field, model_validator
+from enum import Enum
+from pathlib import Path
+from typing import Literal, Optional, Union
 
-ModelType = Literal["llm", "vlm", "moe", "custom"]
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-# Benchmark workflow
-class BenchmarkModelEntry(BaseModel):
-    name: str
-    path: str
-    is_local: bool = False
-    # Optional per-model overrides
-    gpu_memory_utilization: float = 0.85
-    max_model_len: int = 4096
-
-
-# Shared
-class CalibrationConfig(BaseModel):
-    dataset_id: str
-    dataset_subset: Optional[str] = None
-    dataset_split: str = "train"
-    num_samples: int = 64
-    max_seq_length: int = 512
-    batch_size: int = 1
+# Enums / Literals
+class QuantScheme(str, Enum):
+    """All supported quantization bit-schemes."""
+    W4A16 = "W4A16"
+    W4A16_ASYM = "W4A16_ASYM"
+    W8A8 = "W8A8"
+    W8A8_ASYM = "W8A8_ASYM"
+    W8A16 = "W8A16"
+    FP8 = "FP8"
+    FP8_DYNAMIC = "FP8_DYNAMIC"
+    FP8_BLOCK = "FP8_BLOCK"
+    NVFP4 = "NVFP4"
+    MXFP4 = "MXFP4"
 
 
-# Quantize workflow
+QuantSchemeLiteral = Literal[
+    "W4A16", "W4A16_ASYM",
+    "W8A8", "W8A8_ASYM", "W8A16",
+    "FP8", "FP8_DYNAMIC", "FP8_BLOCK",
+    "NVFP4", "MXFP4",
+]
+
+MethodLiteral = Literal["awq", "gptq", "turboquant"]
+ModalityLiteral = Literal["auto", "text", "vision", "audio"]
+ModelTypeLiteral = Literal["llm", "vlm", "moe", "custom"]
+
+# New type for observers
+ObserverLiteral = Literal["mse", "minmax", "maxabs", "percentile"]
+
+# Sub-configs
 class ModelConfig(BaseModel):
+    """Model loading configuration."""
     model_id: str
     torch_dtype: str = "bfloat16"
     device_map: str = "auto"
     trust_remote_code: bool = True
-    model_type : ModelType = "llm"
+    model_type: ModelTypeLiteral = "llm"
+    modality: ModalityLiteral = "auto"
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
 
 
+class SchemeConfig(BaseModel):
+    """Quantization scheme / bit-width configuration."""
+    scheme: QuantSchemeLiteral = "W4A16"
+    group_size: int = 128
+    symmetric: bool = True
+    actorder: bool = False
+    block_size: Optional[list[int]] = Field(
+        default=None,
+        description="Block size for FP8_BLOCK scheme.",
+    )
+    targets: list[str] = Field(default_factory=lambda: ["Linear"])
+    ignore: list[str] = Field(default_factory=lambda: ["lm_head"])
+
+    # NEW advanced quantization parameters
+    observer: ObserverLiteral = "mse"
+    per_channel: bool = False
+    dynamic_activations: bool = False
+
+    @field_validator("group_size")
+    @classmethod
+    def _gs_positive(cls, v: int) -> int:
+        if v <= 0 or (v & (v - 1)) != 0:
+            raise ValueError(f"group_size must be a positive power of 2, got {v}")
+        return v
+
+    @field_validator("block_size")
+    @classmethod
+    def _block_size_2d(cls, v: Optional[list[int]]) -> Optional[list[int]]:
+        if v is None:
+            return v
+        if len(v) != 2 or any(x <= 0 for x in v):
+            raise ValueError(f"block_size must be 2 positive ints [M, N], got {v}")
+        return v
+
+    @field_validator("observer")
+    @classmethod
+    def _valid_observer(cls, v: str) -> str:
+        if v not in {"mse", "minmax", "maxabs", "percentile"}:
+            raise ValueError(f"observer must be one of 'mse', 'minmax', 'maxabs', 'percentile', got {v}")
+        return v
+
+
+class CalibrationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_name: str = "HuggingFaceH4/ultrachat_200k"
+    num_samples: int = 512
+    max_seq_len: int = 2048
+    split: str = "train_sft"
+    image_field: Optional[str] = "image"
+    text_field: Optional[str] = "text"
+    seed: int = 42
+    dataset_format:     str          = "auto"   # "auto" | "chat" | "image_text"
+    instruction_prompt: Optional[str] = None    # None = auto-select based on dataset
+    
+    @field_validator("num_samples", "max_seq_len")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("must be > 0")
+        return v
+
+
+class OutputConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    output_dir: Path
+    save_compressed: bool = True
+    save_processor: bool = True
+    push_to_hub: Optional[str] = None
+
+    @field_validator("output_dir", mode="before")
+    @classmethod
+    def _coerce_path(cls, v) -> Path:
+        return Path(v).expanduser()
+
+
+from typing import List, Tuple, Union
+class SmoothQuantConfig(BaseModel):
+    enabled: bool = True
+    strength: float = 0.5
+    mappings: List[List[Union[List[str], str]]] = [
+        [["re:.*q_proj", "re:.*k_proj", "re:.*v_proj"], "re:.*input_layernorm"],
+        [["re:.*gate_proj", "re:.*up_proj"], "re:.*post_attention_layernorm"],
+    ]
+
+
 class AWQParams(BaseModel):
+    """AWQ-specific hyperparameters."""
     duo_scaling: bool = False
 
 
 class GPTQParams(BaseModel):
-    block_size: int = 128
+    """GPTQ-specific hyperparameters."""
     dampening_frac: float = 0.01
     sequential_update: bool = True
 
-    # SmoothQuant integration
-    smoothquant_enabled: bool = False
-    smoothquant_strength: float = 0.5
+
+# Top-level QuantizeConfig
+_AWQ_ALLOWED_SCHEMES: set[str] = {"W4A16", "W4A16_ASYM"}
+_FP_SCHEMES: set[str] = {"FP8", "FP8_DYNAMIC", "FP8_BLOCK", "NVFP4", "MXFP4"}
+BackendLiteral = Literal["llm_compressor", "modelopt"]
 
 
-class QuantMethodConfig(BaseModel):
-    method: Literal["awq", "gptq", "turboquant"]
-    num_bits: int = 4
-    group_size: int = 128
-    symmetric: bool = True
-    targets: list[str] = Field(default_factory=lambda: ["Linear"])
-    ignore: list[str] = Field(default_factory=list)
-
-    # Method-specific sub-configs (optional; provide only the relevant one)
+class QuantizeConfig(BaseModel):
+    method: MethodLiteral
+    backend: BackendLiteral = "llm_compressor"
+    model: ModelConfig
+    scheme: SchemeConfig = Field(default_factory=SchemeConfig)
+    calibration: CalibrationConfig
+    output: OutputConfig = Field(default_factory=OutputConfig)
+    smoothquant: Optional[SmoothQuantConfig] = None
     awq: Optional[AWQParams] = None
     gptq: Optional[GPTQParams] = None
 
     @model_validator(mode="after")
-    def _inject_defaults(self) -> QuantMethodConfig:
-        """Ensure the matching sub-config always has a value."""
+    def _validate_method_scheme_compat(self) -> QuantizeConfig:
+        scheme = self.scheme.scheme
+        if self.method == "awq" and scheme not in _AWQ_ALLOWED_SCHEMES:
+            raise ValueError(
+                f"method='awq' requires scheme in {_AWQ_ALLOWED_SCHEMES}, "
+                f"got '{scheme}'."
+            )
+        if self.method == "awq" and scheme in _FP_SCHEMES:
+            raise ValueError(
+                f"FP-based schemes ({_FP_SCHEMES}) are not supported with "
+                f"method='awq'."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _inject_method_defaults(self) -> QuantizeConfig:
         if self.method == "awq" and self.awq is None:
             self.awq = AWQParams()
         if self.method == "gptq" and self.gptq is None:
@@ -75,15 +191,34 @@ class QuantMethodConfig(BaseModel):
         return self
 
 
-class QuantizeConfig(BaseModel):
-    """Root schema for configs/quantize/*.yaml"""
-    model: ModelConfig
-    quantization: QuantMethodConfig
-    calibration: CalibrationConfig
-    output: OutputConfig
+class BenchmarkModelEntry(BaseModel):
+    name: str
+    path: str
+    is_local: bool = False
+    gpu_memory_utilization: float = 0.85
+    max_model_len: int = 4096
 
 
-class OutputConfig(BaseModel):
-    base_dir: str = "outputs"
-    save_compressed: bool = True
-    save_dir_suffix: str = "-quantized"
+class TrackingConfig(BaseModel):
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    langfuse_enabled: bool = False
+    mlflow_tracking_uri: Optional[str] = None
+    mlflow_experiment: str = "TripleQuant-VLM"
+    local_output_dir: Path = Path("./benchmark_results")
+
+    @field_validator("local_output_dir", mode="before")
+    @classmethod
+    def _coerce_path(cls, v) -> Path:
+        return Path(v).expanduser()
+
+
+class BenchmarkConfig(BaseModel):
+    models: List[BenchmarkModelEntry] = Field(default_factory=list)
+    tasks: List[str] = Field(default_factory=lambda: ["text", "ocr"])
+    dataset_name: str = "HuggingFaceH4/ultrachat_200k"
+    ocr_dataset_name: str = "linxy/LaTeX_OCR"
+    num_samples: int = 100
+    max_new_tokens: int = 256
+    seed: int = 42
+    tracking: TrackingConfig = Field(default_factory=TrackingConfig)
