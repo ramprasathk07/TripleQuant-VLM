@@ -1,4 +1,7 @@
-# src/quantization/factory.py
+"""Quantizer factory for backend selection.
+
+Routes QuantizeConfig to appropriate backend implementation (llm_compressor or modelopt).
+"""
 from __future__ import annotations
 
 import logging
@@ -9,13 +12,24 @@ from .llm_compressor import LLMCompressorQuantizer
 logger = logging.getLogger(__name__)
 
 def get_quantizer(config: QuantizeConfig) -> BaseQuantizer:
-    """Factory to instantiate the appropriate quantizer based on config.backend."""
+    """Instantiate quantizer for the configured backend.
+
+    Args:
+        config: QuantizeConfig specifying backend choice.
+
+    Returns:
+        BaseQuantizer subclass instance (LLMCompressorQuantizer or ModelOptQuantizer).
+
+    Raises:
+        ImportError: If modelopt backend is selected but nvidia-modelopt is not installed.
+        ValueError: If backend is not recognized.
+    """
     if config.backend == "llm_compressor":
         logger.info("Creating LLMCompressorQuantizer")
         return LLMCompressorQuantizer(config)
     elif config.backend == "modelopt":
         try:
-            from .modelOpy import ModelOptQuantizer
+            from .modelopt import ModelOptQuantizer
         except ImportError as e:
             raise ImportError(
                 "nvidia-modelopt is required for backend='modelopt'.\n"

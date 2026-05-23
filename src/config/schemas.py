@@ -1,18 +1,21 @@
-"""
-config/schemas.py — Pydantic v2 schemas for TripleQuant-VLM.
-Single source of truth for all configuration.
+"""Pydantic v2 schemas for TripleQuant-VLM quantization and benchmarking.
+
+This module defines the single source of truth for all configuration: quantization
+schemes, model loading, calibration, output paths, and benchmarking. Each schema
+is validated at instantiation and includes custom validators for constraints
+(e.g., group_size must be a power of 2, block_size must be 2D positive integers).
 """
 from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Enums / Literals
 class QuantScheme(str, Enum):
-    """All supported quantization bit-schemes."""
+    """All supported quantization bit-schemes and data types."""
     W4A16 = "W4A16"
     W4A16_ASYM = "W4A16_ASYM"
     W8A8 = "W8A8"
@@ -41,7 +44,7 @@ ObserverLiteral = Literal["mse", "minmax", "maxabs", "percentile"]
 
 # Sub-configs
 class ModelConfig(BaseModel):
-    """Model loading configuration."""
+    """Hugging Face model loading configuration including dtype, device placement, and vision/text modality hints."""
     model_id: str
     torch_dtype: str = "bfloat16"
     device_map: str = "auto"
@@ -53,7 +56,11 @@ class ModelConfig(BaseModel):
 
 
 class SchemeConfig(BaseModel):
-    """Quantization scheme / bit-width configuration."""
+    """Quantization scheme and bit-width configuration.
+
+    Controls precision (W4A16, W8A8, FP8, etc.), group size for grouped quantization,
+    symmetry, activation order heuristic, and observer/calibration strategy.
+    """
     scheme: QuantSchemeLiteral = "W4A16"
     group_size: int = 128
     symmetric: bool = True
@@ -65,7 +72,6 @@ class SchemeConfig(BaseModel):
     targets: list[str] = Field(default_factory=lambda: ["Linear"])
     ignore: list[str] = Field(default_factory=lambda: ["lm_head"])
 
-    # NEW advanced quantization parameters
     observer: ObserverLiteral = "mse"
     per_channel: bool = False
     dynamic_activations: bool = False
@@ -86,21 +92,19 @@ class SchemeConfig(BaseModel):
             raise ValueError(f"block_size must be 2 positive ints [M, N], got {v}")
         return v
 
-    @field_validator("observer")
-    @classmethod
-    def _valid_observer(cls, v: str) -> str:
-        if v not in {"mse", "minmax", "maxabs", "percentile"}:
-            raise ValueError(f"observer must be one of 'mse', 'minmax', 'maxabs', 'percentile', got {v}")
-        return v
-
 
 class CalibrationConfig(BaseModel):
+    """Calibration dataset and preprocessing configuration for quantization.
+
+    Specifies the dataset source, number of samples, sequence length, field names
+    (for text and image columns), and format detection strategy (auto, chat, or image_text).
+    """
     model_config = ConfigDict(extra="forbid")
 
     dataset_name: str = "HuggingFaceH4/ultrachat_200k"
     num_samples: int = 512
     max_seq_len: int = 2048
-    split: str = "train_sft"
+    split: str = "train"
     image_field: Optional[str] = "image"
     text_field: Optional[str] = "text"
     seed: int = 42
@@ -116,9 +120,14 @@ class CalibrationConfig(BaseModel):
 
 
 class OutputConfig(BaseModel):
+    """Output and model export configuration.
+
+    Specifies output directory, whether to save in compressed format, processor/tokenizer
+    preservation, and optional Hugging Face Hub integration.
+    """
     model_config = ConfigDict(extra="forbid")
 
-    output_dir: Path
+    output_dir: Path = Path("./output")
     save_compressed: bool = True
     save_processor: bool = True
     push_to_hub: Optional[str] = None
@@ -129,8 +138,12 @@ class OutputConfig(BaseModel):
         return Path(v).expanduser()
 
 
-from typing import List, Tuple, Union
 class SmoothQuantConfig(BaseModel):
+    """SmoothQuant activation quantization configuration.
+
+    Enables layer-wise smooth quantization with per-layer strength and module
+    mappings that define which quantization layers follow which linear layers.
+    """
     enabled: bool = True
     strength: float = 0.5
     mappings: List[List[Union[List[str], str]]] = [
@@ -152,11 +165,16 @@ class GPTQParams(BaseModel):
 
 # Top-level QuantizeConfig
 _AWQ_ALLOWED_SCHEMES: set[str] = {"W4A16", "W4A16_ASYM"}
-_FP_SCHEMES: set[str] = {"FP8", "FP8_DYNAMIC", "FP8_BLOCK", "NVFP4", "MXFP4"}
 BackendLiteral = Literal["llm_compressor", "modelopt"]
 
 
 class QuantizeConfig(BaseModel):
+    """Top-level quantization configuration combining method, scheme, backend, and tuning options.
+
+    Orchestrates model loading, calibration data, quantization scheme/backend selection,
+    and optional tuning (AWQ duo-scaling, GPTQ dampening, SmoothQuant). Validates
+    method-scheme compatibility (e.g., AWQ only supports W4A16 variants).
+    """
     method: MethodLiteral
     backend: BackendLiteral = "llm_compressor"
     model: ModelConfig
@@ -175,11 +193,6 @@ class QuantizeConfig(BaseModel):
                 f"method='awq' requires scheme in {_AWQ_ALLOWED_SCHEMES}, "
                 f"got '{scheme}'."
             )
-        if self.method == "awq" and scheme in _FP_SCHEMES:
-            raise ValueError(
-                f"FP-based schemes ({_FP_SCHEMES}) are not supported with "
-                f"method='awq'."
-            )
         return self
 
     @model_validator(mode="after")
@@ -192,6 +205,7 @@ class QuantizeConfig(BaseModel):
 
 
 class BenchmarkModelEntry(BaseModel):
+    """Single model entry for benchmarking with vLLM serving configuration."""
     name: str
     path: str
     is_local: bool = False
@@ -200,6 +214,11 @@ class BenchmarkModelEntry(BaseModel):
 
 
 class TrackingConfig(BaseModel):
+    """Experiment tracking and result logging configuration for benchmarks.
+
+    Supports Weights and Biases (wandb), Langfuse, and MLflow integrations
+    with local fallback to filesystem output.
+    """
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
     langfuse_enabled: bool = False
@@ -214,6 +233,11 @@ class TrackingConfig(BaseModel):
 
 
 class BenchmarkConfig(BaseModel):
+    """Benchmark task configuration for vLLM serving evaluation.
+
+    Specifies models to benchmark, evaluation tasks (text, OCR), calibration dataset,
+    and tracking/logging destinations for results.
+    """
     models: List[BenchmarkModelEntry] = Field(default_factory=list)
     tasks: List[str] = Field(default_factory=lambda: ["text", "ocr"])
     dataset_name: str = "HuggingFaceH4/ultrachat_200k"

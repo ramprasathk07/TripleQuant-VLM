@@ -1,10 +1,14 @@
-# quantization/modelopt_quantizer.py
+"""NVIDIA ModelOpt quantization backend supporting FP8, NVFP4, MXFP4, INT variants.
+
+Integrates nvidia-modelopt library for low-precision quantization with advanced
+observer strategies (MSE, minmax, percentile), per-channel granularity, and
+dynamic activation support. Automatically excludes vision modules for VLMs.
+"""
 from __future__ import annotations
 import logging
 import torch
-from typing import Dict, Any, List, Optional, Callable
-from datasets import load_dataset, Dataset
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from typing import Dict, Any, List
+from datasets import load_dataset
 
 import modelopt.torch.quantization as mtq
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
@@ -16,16 +20,27 @@ logger = logging.getLogger(__name__)
 
 
 class ModelOptQuantizer(BaseQuantizer):
-    """NVIDIA ModelOpt quantizer supporting NVFP4, MXFP4, FP8, INT4, INT8, with advanced tuning."""
+    """NVIDIA ModelOpt quantizer.
+
+    Supports FP8, NVFP4, MXFP4, INT4, INT8 quantization schemes with configurable
+    observer strategies, per-channel quantization, dynamic activations, and AWQ
+    integration. Multimodal-ready with automatic vision module exclusion.
+
+    Attributes:
+        _calib_dataloader: Prepared dataloader for calibration forward passes.
+    """
 
     def __init__(self, config: QuantizeConfig) -> None:
         super().__init__(config)
         self._calib_dataloader = None
 
-    # -------------------------------------------------------------------------
-    # Main entry point
-    # -------------------------------------------------------------------------
     def quantize(self) -> None:
+        """Run NVIDIA ModelOpt quantization with configured scheme and observer.
+
+        Orchestrates: calibration dataloader preparation, quantization config
+        building (scheme mapping + observer selection), apply_quantization with
+        forward loop, and model export.
+        """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
@@ -40,18 +55,23 @@ class ModelOptQuantizer(BaseQuantizer):
         self.save(str(self.config.output.output_dir))
         logger.info("Quantization finished and model saved to %s", self.config.output.output_dir)
 
-    # -------------------------------------------------------------------------
-    # Calibration data loading (multimodal)
-    # -------------------------------------------------------------------------
     def _prepare_calibration_dataloader(self) -> None:
-        """Load and preprocess calibration dataset, supporting both text and images."""
+        """Load and preprocess calibration dataset for ModelOpt forward loop.
+
+        Assumes chat-format datasets with optional image fields for VLMs.
+        Preprocesses to input_ids, attention_mask, and optionally pixel_values
+        via apply_chat_template. Prepares dataloader via get_dataset_dataloader.
+
+        Raises:
+            ValueError: If no tokenizer/processor is available.
+        """
         cal = self.config.calibration
         tokenizer = self.processor if self.processor else self.tokenizer
         if tokenizer is None:
             raise ValueError("No tokenizer/processor available for calibration.")
 
-        # Load raw dataset (assumes 'LLM' configuration or use default)
-        ds = load_dataset(cal.dataset_name, name="LLM", split=f"train[:{cal.num_samples}]")
+        split = cal.split if "[:" in cal.split else f"{cal.split}[:{cal.num_samples}]"
+        ds = load_dataset(cal.dataset_name, split=split)
         ds = ds.shuffle(seed=cal.seed)
 
         is_vlm = self._is_vlm()
@@ -107,7 +127,16 @@ class ModelOptQuantizer(BaseQuantizer):
         self._calib_dataloader = get_dataset_dataloader(ds, batch_size=1, collate_fn=self._collate_fn)
 
     def _collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """Collate a batch of samples (single sample only for VLM stability)."""
+        """Collate batch of preprocessed samples into tensor dictionary.
+
+        Stacks input_ids, attention_mask, and pixel_values (if present).
+
+        Args:
+            batch: List of preprocessed examples with input_ids, attention_mask, optional pixel_values.
+
+        Returns:
+            Dict with stacked tensors: input_ids, attention_mask, and optionally pixel_values.
+        """
         input_ids = torch.stack([item["input_ids"] for item in batch])
         attention_mask = torch.stack([item["attention_mask"] for item in batch])
         collated = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -116,56 +145,25 @@ class ModelOptQuantizer(BaseQuantizer):
             collated["pixel_values"] = pixel_values
         return collated
 
-    # -------------------------------------------------------------------------
-    # Vision tower detection and ignore pattern merging
-    # -------------------------------------------------------------------------
-    def _is_vlm(self) -> bool:
-        cfg = getattr(self.model, "config", None)
-        if cfg is None:
-            return False
-        if hasattr(cfg, "vision_config") or hasattr(cfg, "vision_tower"):
-            return True
-        arch = getattr(cfg, "architectures", [None])[0]
-        if arch and any(v in arch.lower() for v in ("vl", "vision", "multi_modal")):
-            return True
-        return False
-
-    def _get_vision_ignore_patterns(self) -> List[str]:
-        if not self._is_vlm():
-            return []
-        return [
-            "re:.*visual.*",
-            "re:.*vision_tower.*",
-            "re:.*vision_model.*",
-            "re:.*mm_projector.*",
-            "re:.*multi_modal_projector.*",
-            "re:.*merger.*",
-            "re:.*patch_embed.*",
-        ]
-
-    def _merged_ignore_patterns(self) -> List[str]:
-        """Return list of module name patterns to exclude from quantization."""
-        user_ignore = self.config.scheme.ignore
-        vision_ignore = self._get_vision_ignore_patterns()
-        merged = list(user_ignore)
-        for pat in vision_ignore:
-            if pat not in merged:
-                merged.append(pat)
-        if vision_ignore:
-            logger.info("Auto‑ignoring vision modules: %s", vision_ignore)
-        return merged
-
-    # -------------------------------------------------------------------------
-    # Build ModelOpt quantization config with advanced options
-    # -------------------------------------------------------------------------
     def _build_modelopt_config(self) -> Dict[str, Any]:
-        """Convert our SchemeConfig into a ModelOpt quant_cfg dict, respecting observer, per_channel, etc."""
+        """Build ModelOpt quantization config from SchemeConfig and advanced options.
+
+        Maps quantization scheme (W4A16, W8A8, FP8, NVFP4, etc.) to ModelOpt
+        defaults, applies observer strategy, per_channel/dynamic_activation tuning,
+        excludes vision modules via merged ignore patterns, and handles AWQ if requested.
+
+        Returns:
+            Dict with ModelOpt quant_cfg structure (algorithm, quant_cfg sub-dict, etc.).
+
+        Raises:
+            ValueError: If scheme is not supported by ModelOpt backend.
+        """
         scheme = self.config.scheme.scheme
         group_size = self.config.scheme.group_size
         symmetric = self.config.scheme.symmetric
-        observer = getattr(self.config.scheme, "observer", "mse")
-        per_channel = getattr(self.config.scheme, "per_channel", False)
-        dynamic_activations = getattr(self.config.scheme, "dynamic_activations", False)
+        observer = self.config.scheme.observer
+        per_channel = self.config.scheme.per_channel
+        dynamic_activations = self.config.scheme.dynamic_activations
 
         # Map our observer strings to ModelOpt algorithm names
         observer_map = {
@@ -248,8 +246,15 @@ class ModelOptQuantizer(BaseQuantizer):
         return quant_cfg
 
     def _exclude_vision_modules(self, quant_cfg: Dict[str, Any]) -> Dict[str, Any]:
-        """Set quantize=False for all patterns in the merged ignore list."""
-        ignore_patterns = self._merged_ignore_patterns()
+        """Set quantize=False in quant_cfg for all merged ignore patterns.
+
+        Args:
+            quant_cfg: ModelOpt quantization config dict to modify in-place.
+
+        Returns:
+            Modified quant_cfg with vision modules marked quantize=False.
+        """
+        ignore_patterns = self._merged_ignore()
         if not ignore_patterns:
             return quant_cfg
         # Ensure quant_cfg has a "quant_cfg" subsection
@@ -262,49 +267,55 @@ class ModelOptQuantizer(BaseQuantizer):
         return quant_cfg
 
     def _get_nvfp4_cfg(self, group_size: int, symmetric: bool, observer: str, per_channel: bool) -> Dict[str, Any]:
-        """Custom config for NVFP4 (4‑bit float, 2 exponent bits)."""
-        return {
-            "algorithm": observer,
-            "quant_cfg": {
-                ".*weight": {
-                    "num_bits": 4,
-                    "type": "float",
-                    "symmetric": symmetric,
-                    "group_size": group_size,
-                    "per_channel": per_channel,
-                    "exponent_bits": 2,
-                    "mantissa_bits": 1,
-                }
-            },
-            "quantize_input": False,
-            "quantize_output": False,
-        }
+        """Build NVFP4 quantization config from ModelOpt defaults with custom overrides.
+
+        Args:
+            group_size: Grouped quantization granularity.
+            symmetric: Symmetric or asymmetric quantization.
+            observer: Calibration observer strategy (not used for NVFP4 but kept for API consistency).
+            per_channel: Per-channel vs. per-group quantization.
+
+        Returns:
+            NVFP4 ModelOpt config dict.
+        """
+        cfg = mtq.NVFP4_DEFAULT_CFG.copy()
+        weight_cfg = cfg["quant_cfg"][".*weight"]
+        weight_cfg["group_size"] = group_size
+        weight_cfg["symmetric"] = symmetric
+        weight_cfg["per_channel"] = per_channel
+        return cfg
 
     def _get_mxfp4_cfg(self, group_size: int, symmetric: bool, observer: str, per_channel: bool) -> Dict[str, Any]:
-        """Custom config for MXFP4 (Microscaling FP4 with block scaling)."""
-        return {
-            "algorithm": observer,
-            "quant_cfg": {
-                ".*weight": {
-                    "num_bits": 4,
-                    "type": "float",
-                    "symmetric": symmetric,
-                    "group_size": group_size,
-                    "per_channel": per_channel,
-                    "block_scaling": True,
-                    "exponent_bits": 2,
-                    "mantissa_bits": 1,
-                }
-            },
-            "quantize_input": False,
-            "quantize_output": False,
-        }
+        """Build MXFP4 quantization config from ModelOpt defaults with custom overrides.
 
-    # -------------------------------------------------------------------------
-    # Apply quantization using ModelOpt
-    # -------------------------------------------------------------------------
+        Args:
+            group_size: Grouped quantization granularity.
+            symmetric: Symmetric or asymmetric quantization.
+            observer: Calibration observer strategy (not used for MXFP4 but kept for API consistency).
+            per_channel: Per-channel vs. per-group quantization.
+
+        Returns:
+            MXFP4 ModelOpt config dict.
+        """
+        cfg = mtq.MXFP4_DEFAULT_CFG.copy()
+        weight_cfg = cfg["quant_cfg"][".*weight"]
+        weight_cfg["group_size"] = group_size
+        weight_cfg["symmetric"] = symmetric
+        weight_cfg["per_channel"] = per_channel
+        return cfg
+
     def _apply_quantization(self, quant_cfg: Dict[str, Any]) -> None:
-        """Run mtq.quantize with forward loop for calibration."""
+        """Apply ModelOpt quantization with calibration forward loop.
+
+        Ensures model is on GPU, defines forward_loop for calibration using
+        prepared dataloader, calls mtq.quantize(), and moves model back to CPU.
+
+        Args:
+            quant_cfg: ModelOpt quantization config dict.
+
+        Raises:
+            Exception: If mtq.quantize fails (wrapped with logging).
+        """
         # Move model to GPU
         if next(self.model.parameters()).device.type != "cuda":
             self.model.to("cuda")
@@ -329,31 +340,11 @@ class ModelOptQuantizer(BaseQuantizer):
         # After quantization, move back to CPU for saving
         self.model.to("cpu")
 
-    # -------------------------------------------------------------------------
-    # Native save support (ModelOpt + compressed tensors)
-    # -------------------------------------------------------------------------
     def save(self, output_dir: str, weights: bool = True) -> None:
-        """Save quantized model natively. Optionally exports to TensorRT Engine."""
-        if weights:
-            self.model.to("cpu")
-            if hasattr(self.model, "hf_device_map"):
-                del self.model.hf_device_map
+        """Save quantized model via BaseQuantizer with descriptive subfolder naming.
 
-            # Attempt to use ModelOpt's export if available (for INT8/FP8)
-            try:
-                from modelopt.torch.export import export_tensorrt_engine
-                # This exports to a TensorRT engine; but we also want the HuggingFace format.
-                # For simplicity, we first save with save_pretrained.
-                self.model.save_pretrained(output_dir, save_compressed=self.config.output.save_compressed)
-                logger.info("Saved HuggingFace model to %s", output_dir)
-                # Optionally export to TensorRT for deployment
-                # export_tensorrt_engine(self.model, output_dir + "/engine")
-            except ImportError:
-                # Fallback: standard save_pretrained (works for INT4/INT8)
-                self.model.save_pretrained(output_dir, save_compressed=self.config.output.save_compressed)
-                logger.info("Saved quantized model (no TensorRT export) to %s", output_dir)
-        # Save processor/tokenizer
-        if self.processor and self.config.output.save_processor:
-            self.processor.save_pretrained(output_dir)
-        if self.tokenizer and self.config.output.save_processor:
-            self.tokenizer.save_pretrained(output_dir)
+        Args:
+            output_dir: Root output directory path.
+            weights: If True, save model weights; if False, skip model saving.
+        """
+        super().save(output_dir, weights=weights)

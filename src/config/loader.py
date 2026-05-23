@@ -1,11 +1,7 @@
-"""
-Config loader: YAML → validated Pydantic model.
+"""YAML configuration loaders for QuantizeConfig and BenchmarkConfig.
 
-Usage:
-    from src.config import load_quantize_config, load_benchmark_config
-
-    q_cfg = load_quantize_config("configs/quantize/qwen25vl_3b_awq.yaml")
-    b_cfg = load_benchmark_config("configs/benchmark/ocr_comparison.yaml")
+Parses YAML config files and validates against Pydantic schemas, raising
+ValidationError with field-level details on constraint violations.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -15,6 +11,7 @@ from pydantic import ValidationError
 from .schemas import BenchmarkConfig, QuantizeConfig
 
 def _read_yaml(path: str | Path) -> dict:
+    """Read and parse YAML file, raising FileNotFoundError if missing."""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Config file not found: {p.resolve()}")
@@ -22,8 +19,18 @@ def _read_yaml(path: str | Path) -> dict:
         return yaml.safe_load(f) or {}
 
 def load_quantize_config(path: str | Path) -> QuantizeConfig:
-    """Load and validate a quantize config YAML."""
+    """Load and validate quantization config from YAML.
 
+    Args:
+        path: Path to YAML config file.
+
+    Returns:
+        QuantizeConfig: Validated quantization configuration.
+
+    Raises:
+        FileNotFoundError: If config file does not exist.
+        ValueError: If YAML does not conform to QuantizeConfig schema.
+    """
     raw = _read_yaml(path)
     try:
         return QuantizeConfig.model_validate(raw)
@@ -34,8 +41,18 @@ def load_quantize_config(path: str | Path) -> QuantizeConfig:
         ) from exc
 
 def load_benchmark_config(path: str | Path) -> BenchmarkConfig:
-    """Load and validate a benchmark config YAML."""
+    """Load and validate benchmark config from YAML.
 
+    Args:
+        path: Path to YAML config file.
+
+    Returns:
+        BenchmarkConfig: Validated benchmark configuration.
+
+    Raises:
+        FileNotFoundError: If config file does not exist.
+        ValueError: If YAML does not conform to BenchmarkConfig schema.
+    """
     raw = _read_yaml(path)
     try:
         return BenchmarkConfig.model_validate(raw)

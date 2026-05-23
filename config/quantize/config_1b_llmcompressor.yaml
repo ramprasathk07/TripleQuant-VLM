@@ -28,7 +28,7 @@ calibration:
   seed: 42
 
 output:
-  output_dir: ./tinyllama-1b-awq-llmcompressor
+  output_dir: ./outputs/tinyllama-1b-awq-llmcompressor
   save_compressed: true
   save_processor: true
 

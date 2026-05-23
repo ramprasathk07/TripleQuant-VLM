@@ -1,8 +1,13 @@
-# quantization/llmcompressor_quantizer.py
+"""LLMCompressor quantization backend supporting AWQ, GPTQ, PTQ, and SmoothQuant.
+
+Integrates llm-compressor library for multimodal quantization with support for
+both text-only LLMs and vision-language models (VLMs). Handles automatic dataset
+format detection (chat vs. image-text) and per-batch calibration.
+"""
 from __future__ import annotations
 import logging
 import torch
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datasets import load_dataset, Dataset
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -16,12 +21,24 @@ logger = logging.getLogger(__name__)
 
 
 class LLMCompressorQuantizer(BaseQuantizer):
+    """LLMCompressor quantization backend.
+
+    Supports AWQ (activation-aware), GPTQ (gradient-based), and PTQ (post-training)
+    quantization with optional SmoothQuant activation quantization. Handles both
+    text and multimodal calibration datasets with automatic format detection and
+    preprocessing for chat vs. image-text formats.
+    """
+
     def __init__(self, config: QuantizeConfig):
         super().__init__(config)
-        self._profile = None  # optional: use arch_profile from detect_profile
+        self._profile = None
 
     def quantize(self) -> None:
-        """Run llmcompressor oneshot with full configuration."""
+        """Run llmcompressor oneshot quantization with configured scheme and modifiers.
+
+        Orchestrates: dataset loading (with format auto-detection), recipe building
+        (modifiers for AWQ/GPTQ/PTQ + SmoothQuant), oneshot calibration, and model export.
+        """
         logger.info("Starting LLMCompressor quantization with backend=llm_compressor")
         # 1. Load calibration dataset (handles text and images)
         dataset = self._load_calibration_dataset()
@@ -43,10 +60,19 @@ class LLMCompressorQuantizer(BaseQuantizer):
         self.save(str(self.config.output.output_dir))
         logger.info("Quantization finished and model saved to %s", self.config.output.output_dir)
 
-    # -------------------------------------------------------------------------
-    # Calibration data loading (multimodal)
-    # -------------------------------------------------------------------------
     def _load_calibration_dataset(self) -> Dataset:
+        """Load and preprocess calibration dataset with format auto-detection.
+
+        Supports chat-format datasets (ultrachat_200k style) and image-text pairs
+        (LaTeX_OCR style). Auto-detects format and column names; handles VLM-specific
+        image preprocessing (RGB conversion, minimum size enforcement).
+
+        Returns:
+            Preprocessed Dataset with tokenized inputs and pixel_values (if VLM).
+
+        Raises:
+            ValueError: If dataset split, image column, or text column cannot be resolved.
+        """
         cal = self.config.calibration
         split = getattr(cal, 'split', 'train')
         if "[:" not in split:
@@ -135,7 +161,7 @@ class LLMCompressorQuantizer(BaseQuantizer):
         # ── Preprocessors ─────────────────────────────────────────────────────
 
         def preprocess_chat(example):
-            """For chat-format datasets like ultrachat_200k."""
+            """Preprocess chat-format example (messages field) for LLM or VLM."""
             messages = []
             for msg in example["messages"]:
                 if is_vlm and cal.image_field and cal.image_field in example:
@@ -172,14 +198,14 @@ class LLMCompressorQuantizer(BaseQuantizer):
                     return_dict=True,
                     add_generation_prompt=False,
                 )
-            return {k: v for k, v in processed.items()}
+            return dict(processed)
 
         def preprocess_image_text(example):
-            """
-            For image-text pair datasets like LaTeX_OCR.
-            Builds a single-turn VLM message:
-            user:      [image] + instruction prompt
-            assistant: ground-truth text (formula / caption / label)
+            """Preprocess image-text pair (e.g., LaTeX_OCR) into chat format.
+
+            Constructs user-assistant message pair: user turn has [image] + instruction,
+            assistant turn has ground-truth text. Enforces RGB PIL format and minimum
+            56x56 size to avoid Qwen2.5-VL smart_resize crashes.
             """
             from PIL import Image as PILImage
 
@@ -191,7 +217,6 @@ class LLMCompressorQuantizer(BaseQuantizer):
                 image = PILImage.fromarray(image)
             if image.mode != "RGB":
                 image = image.convert("RGB")
-            w, h = image.size
             # Qwen2.5-VL smart_resize factor = patch_size(14) * merge_size(2) = 28.
             # round(dim / 28) * 28 = 0 for dim < 14 → resize crash.
             # Enforce minimum 56×56 (2 patches each side).
@@ -252,7 +277,7 @@ class LLMCompressorQuantizer(BaseQuantizer):
                     max_length=cal.max_seq_len,
                 )
 
-            return {k: v for k, v in processed.items()}
+            return dict(processed)
 
         # ── Apply the right preprocessor ─────────────────────────────────────
         if dataset_format == 'chat':
@@ -263,9 +288,18 @@ class LLMCompressorQuantizer(BaseQuantizer):
         return ds
 
     def _data_collator(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """
-        Collate a batch of single sample into a tensor dictionary.
-        Handles pixel_values for VLM.
+        """Collate a batch (single sample only) into tensor dictionary.
+
+        Converts pixel_values to bfloat16; enforces batch_size=1 for stability.
+
+        Args:
+            batch: List of preprocessed examples (length 1).
+
+        Returns:
+            Dict with input_ids, attention_mask, and optionally pixel_values as tensors.
+
+        Raises:
+            AssertionError: If batch length is not 1.
         """
         assert len(batch) == 1, "Only single‑sample batching supported for now"
         elem = batch[0]
@@ -278,63 +312,25 @@ class LLMCompressorQuantizer(BaseQuantizer):
                 collated[key] = torch.tensor(value)
         return collated
 
-    # -------------------------------------------------------------------------
-    # Vision tower detection and ignore pattern merging
-    # -------------------------------------------------------------------------
-    def _is_vlm(self) -> bool:
-        """Heuristic to detect if the loaded model is a vision‑language model."""
-        # Check config for vision-related attributes
-        cfg = getattr(self.model, "config", None)
-        if cfg is None:
-            return False
-        if hasattr(cfg, "vision_config") or hasattr(cfg, "vision_tower"):
-            return True
-        arch = getattr(cfg, "architectures", [None])[0]
-        if arch and any(v in arch.lower() for v in ("vl", "vision", "multi_modal")):
-            return True
-        return False
-
-    def _get_vision_ignore_patterns(self) -> List[str]:
-        """Return regex patterns for common vision tower modules."""
-        if not self._is_vlm():
-            return []
-        return [
-            "re:.*visual.*",
-            "re:.*vision_tower.*",
-            "re:.*vision_model.*",
-            "re:.*mm_projector.*",
-            "re:.*multi_modal_projector.*",
-            "re:.*merger.*",
-            "re:.*patch_embed.*",
-        ]
-
-    def _merged_ignore(self) -> List[str]:
-        """
-        Merge user‑provided ignore patterns with automatic vision‑tower patterns.
-        Ensures vision modules are never quantized.
-        """
-        user_ignore = self.config.scheme.ignore
-        vision_ignore = self._get_vision_ignore_patterns()
-        # Merge without duplicates
-        merged = list(user_ignore)
-        for pat in vision_ignore:
-            if pat not in merged:
-                merged.append(pat)
-        if vision_ignore:
-            logger.info("Auto‑ignoring vision modules: %s", vision_ignore)
-        return merged
-
-    # -------------------------------------------------------------------------
-    # Recipe construction with full configurability
-    # -------------------------------------------------------------------------
     def _build_recipe(self) -> List[Any]:
+        """Build llmcompressor modifier recipe from QuantizeConfig.
+
+        Constructs modifiers for SmoothQuant (if enabled), then AWQ/GPTQ/PTQ
+        based on config.method, with merged ignore patterns and quantization config.
+
+        Returns:
+            List of llmcompressor Modifier instances to pass to oneshot().
+
+        Raises:
+            ValueError: If scheme is unsupported for llm_compressor backend.
+        """
         scheme = self.config.scheme.scheme
         group_size = self.config.scheme.group_size
         symmetric = self.config.scheme.symmetric
         actorder = self.config.scheme.actorder
         targets = self.config.scheme.targets
 
-        observer = getattr(self.config.scheme, "observer", "mse")
+        observer = self.config.scheme.observer
         supported_observers = {"mse", "minmax"}
         if observer not in supported_observers:
             logger.warning(
@@ -342,8 +338,8 @@ class LLMCompressorQuantizer(BaseQuantizer):
             )
             observer = "mse"
 
-        per_channel = getattr(self.config.scheme, "per_channel", False)
-        dynamic_activations = getattr(self.config.scheme, "dynamic_activations", False)
+        per_channel = self.config.scheme.per_channel
+        dynamic_activations = self.config.scheme.dynamic_activations
 
         # Bit width
         if scheme.startswith("W4"):
@@ -351,7 +347,10 @@ class LLMCompressorQuantizer(BaseQuantizer):
         elif scheme.startswith("W8"):
             bits = 8
         else:
-            raise ValueError(f"Unsupported scheme: {scheme}")
+            raise ValueError(
+                f"Unsupported scheme '{scheme}' for backend='llm_compressor'. "
+                f"FP8/NVFP4/MXFP4 schemes require backend='modelopt'."
+            )
 
         strategy = "channel" if per_channel else "group"
 
