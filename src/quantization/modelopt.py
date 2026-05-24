@@ -11,7 +11,7 @@ from typing import Dict, Any, List
 from datasets import load_dataset
 
 import modelopt.torch.quantization as mtq
-from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
+from torch.utils.data import DataLoader
 
 from src.config.schemas import QuantizeConfig
 from .base import BaseQuantizer
@@ -77,13 +77,16 @@ class ModelOptQuantizer(BaseQuantizer):
         is_vlm = self._is_vlm()
 
         def preprocess_fn(example):
-            # Build messages from the dataset (assumes 'messages' field)
+            # Build messages from the dataset (assumes 'messages' field).
+            # VLM templates require list-of-parts content; LLM templates expect plain string.
             messages = []
             for msg in example["messages"]:
-                messages.append({
-                    "role": msg["role"],
-                    "content": [{"type": "text", "text": msg["content"]}]
-                })
+                content = (
+                    [{"type": "text", "text": msg["content"]}]
+                    if is_vlm
+                    else msg["content"]
+                )
+                messages.append({"role": msg["role"], "content": content})
 
             # For VLM, handle images if present
             if is_vlm and cal.image_field and cal.image_field in example:
@@ -124,7 +127,13 @@ class ModelOptQuantizer(BaseQuantizer):
             return result
 
         ds = ds.map(preprocess_fn, batched=False, remove_columns=ds.column_names)
-        self._calib_dataloader = get_dataset_dataloader(ds, batch_size=1, collate_fn=self._collate_fn)
+        ds.set_format(type="torch")
+        self._calib_dataloader = DataLoader(
+            ds,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=self._collate_fn,
+        )
 
     def _collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """Collate batch of preprocessed samples into tensor dictionary.
@@ -145,164 +154,119 @@ class ModelOptQuantizer(BaseQuantizer):
             collated["pixel_values"] = pixel_values
         return collated
 
-    def _build_modelopt_config(self) -> Dict[str, Any]:
-        """Build ModelOpt quantization config from SchemeConfig and advanced options.
+    # Scheme -> modelopt default cfg (non-AWQ path).
+    _SCHEME_CFG_MAP = {
+        "W4A16": "INT4_BLOCKWISE_WEIGHT_ONLY_CFG",
+        "W8A16": "INT8_WEIGHT_ONLY_CFG",
+        "W8A8": "INT8_DEFAULT_CFG",
+        "W8A8_SMOOTH": "INT8_SMOOTHQUANT_CFG",
+        "FP8": "FP8_DEFAULT_CFG",
+        "FP8_DYNAMIC": "FP8_PER_CHANNEL_PER_TOKEN_CFG",
+        "FP8_KV": "FP8_KV_CFG",
+        "NVFP4": "NVFP4_DEFAULT_CFG",
+        "MXFP4": "MXFP4_DEFAULT_CFG",
+        "MXFP6": "MXFP6_DEFAULT_CFG",
+        "MXFP8": "MXFP8_DEFAULT_CFG",
+        "MXINT8": "MXINT8_DEFAULT_CFG",
+    }
 
-        Maps quantization scheme (W4A16, W8A8, FP8, NVFP4, etc.) to ModelOpt
-        defaults, applies observer strategy, per_channel/dynamic_activation tuning,
-        excludes vision modules via merged ignore patterns, and handles AWQ if requested.
+    # AWQ variants of the above.
+    _SCHEME_AWQ_CFG_MAP = {
+        "W4A16": "INT4_AWQ_CFG",
+        "NVFP4": "NVFP4_AWQ_LITE_CFG",
+    }
+
+    def _build_modelopt_config(self) -> Dict[str, Any]:
+        """Build ModelOpt 0.44 list-based quant_cfg from SchemeConfig.
+
+        ModelOpt 0.44+ uses ``quant_cfg`` as an ordered list of
+        ``{"quantizer_name": "<glob>", ...}`` entries. We start from the
+        backend-supplied default for the requested scheme, patch the weight
+        quantizer's ``block_sizes`` to honor ``group_size``, and append
+        ``enable=False`` entries for the merged ignore list.
 
         Returns:
-            Dict with ModelOpt quant_cfg structure (algorithm, quant_cfg sub-dict, etc.).
+            Dict with keys ``quant_cfg`` (list) and ``algorithm`` (str or dict).
 
         Raises:
             ValueError: If scheme is not supported by ModelOpt backend.
         """
         scheme = self.config.scheme.scheme
+        method = self.config.method
         group_size = self.config.scheme.group_size
-        symmetric = self.config.scheme.symmetric
-        observer = self.config.scheme.observer
-        per_channel = self.config.scheme.per_channel
-        dynamic_activations = self.config.scheme.dynamic_activations
 
-        # Map our observer strings to ModelOpt algorithm names
-        observer_map = {
-            "mse": "mse",
-            "minmax": "minmax",
-            "maxabs": "max_abs",
-            "percentile": "percentile",
-        }
-        algorithm = observer_map.get(observer, "max_abs")
+        base = self._select_default_cfg(scheme, method)
+        # Deep copy: list of dicts, each dict may contain a nested "cfg".
+        quant_list = []
+        for entry in base["quant_cfg"]:
+            new_entry = dict(entry)
+            if "cfg" in new_entry:
+                new_entry["cfg"] = dict(new_entry["cfg"])
+                if "block_sizes" in new_entry["cfg"]:
+                    new_entry["cfg"]["block_sizes"] = dict(new_entry["cfg"]["block_sizes"])
+            quant_list.append(new_entry)
 
-        # Base config structure that ModelOpt expects
+        # Patch block_sizes (group_size equivalent) on weight quantizer.
+        if group_size and group_size > 0:
+            for entry in quant_list:
+                if entry.get("quantizer_name") == "*weight_quantizer" and "cfg" in entry:
+                    bs = entry["cfg"].get("block_sizes")
+                    if isinstance(bs, dict) and "-1" in bs:
+                        bs["-1"] = group_size
+
+        # Append ignore patterns as enable=false entries.
+        for pat in self._merged_ignore():
+            glob = self._regex_to_glob(pat)
+            quant_list.append({"quantizer_name": glob, "enable": False})
+
         quant_cfg = {
-            "algorithm": algorithm,
-            "quantize_input": "A8" in scheme or "FP8" in scheme,
-            "quantize_output": False,
+            "quant_cfg": quant_list,
+            "algorithm": base.get("algorithm"),
         }
 
-        # ---- Precision mapping ----
-        if scheme in ("W4A16", "W4A16_ASYM"):
-            quant_cfg = mtq.INT4_DEFAULT_CFG.copy()
-            quant_cfg["quant_cfg"] = {
-                ".*weight": {
-                    "num_bits": 4,
-                    "group_size": group_size,
-                    "symmetric": symmetric and "ASYM" not in scheme,
-                    "observer": algorithm,
-                    "per_channel": per_channel,
-                }
-            }
-        elif scheme in ("W8A8", "W8A8_ASYM"):
-            quant_cfg = mtq.INT8_DEFAULT_CFG.copy()
-            quant_cfg["quant_cfg"][".*weight"]["group_size"] = group_size
-            quant_cfg["quant_cfg"][".*weight"]["symmetric"] = symmetric and "ASYM" not in scheme
-            quant_cfg["quant_cfg"][".*weight"]["observer"] = algorithm
-            quant_cfg["quant_cfg"][".*weight"]["per_channel"] = per_channel
-            if dynamic_activations:
-                quant_cfg["quant_cfg"][".*input"]["dynamic"] = True
-            if "ASYM" in scheme:
-                quant_cfg["quant_cfg"][".*input"]["symmetric"] = False
-        elif scheme == "W8A16":
-            quant_cfg = mtq.INT8_SMOOTHQUANT_CFG.copy() if hasattr(mtq, "INT8_SMOOTHQUANT_CFG") else mtq.INT8_DEFAULT_CFG.copy()
-            quant_cfg["quant_cfg"] = {
-                ".*weight": {
-                    "num_bits": 8,
-                    "symmetric": symmetric,
-                    "observer": algorithm,
-                    "per_channel": per_channel,
-                }
-            }
-        elif scheme == "FP8":
-            quant_cfg = mtq.FP8_DEFAULT_CFG.copy()
-            # FP8 doesn't use group_size
-        elif scheme == "FP8_DYNAMIC":
-            quant_cfg = mtq.FP8_DYNAMIC_CFG.copy()
-        elif scheme == "FP8_BLOCK":
-            if hasattr(mtq, "FP8_BLOCK_CFG"):
-                quant_cfg = mtq.FP8_BLOCK_CFG.copy()
-            else:
-                quant_cfg = mtq.FP8_DEFAULT_CFG.copy()
-            if self.config.scheme.block_size:
-                quant_cfg["quant_cfg"][".*weight"]["block_size"] = self.config.scheme.block_size
-        elif scheme == "NVFP4":
-            quant_cfg = self._get_nvfp4_cfg(group_size, symmetric, algorithm, per_channel)
-        elif scheme == "MXFP4":
-            quant_cfg = self._get_mxfp4_cfg(group_size, symmetric, algorithm, per_channel)
+        logger.info("ModelOpt scheme=%s method=%s algorithm=%s ignore=%d",
+                    scheme, method, quant_cfg["algorithm"], len(self._merged_ignore()))
+        return quant_cfg
+
+    def _select_default_cfg(self, scheme: str, method: str) -> Dict[str, Any]:
+        """Resolve scheme + method to a modelopt default config object.
+
+        Prefers an AWQ variant when ``method == 'awq'`` and one exists for the scheme.
+
+        Raises:
+            ValueError: If scheme has no default mapping in modelopt.
+        """
+        if method == "awq" and scheme in self._SCHEME_AWQ_CFG_MAP:
+            cfg_name = self._SCHEME_AWQ_CFG_MAP[scheme]
+        elif scheme in self._SCHEME_CFG_MAP:
+            cfg_name = self._SCHEME_CFG_MAP[scheme]
         else:
-            raise ValueError(f"Unsupported scheme for ModelOpt: {scheme}")
+            raise ValueError(
+                f"Unsupported scheme '{scheme}' (method='{method}') for backend='modelopt'. "
+                f"Supported schemes: {sorted(self._SCHEME_CFG_MAP)}"
+            )
+        if not hasattr(mtq, cfg_name):
+            raise ValueError(
+                f"modelopt build missing '{cfg_name}' — installed modelopt may be too old."
+            )
+        return getattr(mtq, cfg_name)
 
-        # Apply AWQ if requested
-        if self.config.method == "awq":
-            quant_cfg["algorithm"] = "awq"
-            if self.config.awq and self.config.awq.duo_scaling:
-                quant_cfg["awq_params"] = {"enable_duo_scaling": True}
+    @staticmethod
+    def _regex_to_glob(pattern: str) -> str:
+        """Convert our internal ignore pattern to modelopt's glob form.
 
-        # Exclude vision modules from quantization
-        quant_cfg = self._exclude_vision_modules(quant_cfg)
-
-        logger.info("ModelOpt quant config: algorithm=%s, per_channel=%s, dynamic_activations=%s",
-                    algorithm, per_channel, dynamic_activations)
-        return quant_cfg
-
-    def _exclude_vision_modules(self, quant_cfg: Dict[str, Any]) -> Dict[str, Any]:
-        """Set quantize=False in quant_cfg for all merged ignore patterns.
-
-        Args:
-            quant_cfg: ModelOpt quantization config dict to modify in-place.
-
-        Returns:
-            Modified quant_cfg with vision modules marked quantize=False.
+        Strips leading ``re:`` and ``.*`` markers, wraps with ``*`` on both sides.
+        Examples:
+            ``lm_head``           -> ``*lm_head*``
+            ``re:.*visual.*``     -> ``*visual*``
         """
-        ignore_patterns = self._merged_ignore()
-        if not ignore_patterns:
-            return quant_cfg
-        # Ensure quant_cfg has a "quant_cfg" subsection
-        if "quant_cfg" not in quant_cfg:
-            quant_cfg["quant_cfg"] = {}
-        for pattern in ignore_patterns:
-            # Convert re:.*something to pattern without re: prefix if needed
-            clean_pattern = pattern.replace("re:", "").replace(".*", "")
-            quant_cfg["quant_cfg"][clean_pattern] = {"quantize": False}
-        return quant_cfg
-
-    def _get_nvfp4_cfg(self, group_size: int, symmetric: bool, observer: str, per_channel: bool) -> Dict[str, Any]:
-        """Build NVFP4 quantization config from ModelOpt defaults with custom overrides.
-
-        Args:
-            group_size: Grouped quantization granularity.
-            symmetric: Symmetric or asymmetric quantization.
-            observer: Calibration observer strategy (not used for NVFP4 but kept for API consistency).
-            per_channel: Per-channel vs. per-group quantization.
-
-        Returns:
-            NVFP4 ModelOpt config dict.
-        """
-        cfg = mtq.NVFP4_DEFAULT_CFG.copy()
-        weight_cfg = cfg["quant_cfg"][".*weight"]
-        weight_cfg["group_size"] = group_size
-        weight_cfg["symmetric"] = symmetric
-        weight_cfg["per_channel"] = per_channel
-        return cfg
-
-    def _get_mxfp4_cfg(self, group_size: int, symmetric: bool, observer: str, per_channel: bool) -> Dict[str, Any]:
-        """Build MXFP4 quantization config from ModelOpt defaults with custom overrides.
-
-        Args:
-            group_size: Grouped quantization granularity.
-            symmetric: Symmetric or asymmetric quantization.
-            observer: Calibration observer strategy (not used for MXFP4 but kept for API consistency).
-            per_channel: Per-channel vs. per-group quantization.
-
-        Returns:
-            MXFP4 ModelOpt config dict.
-        """
-        cfg = mtq.MXFP4_DEFAULT_CFG.copy()
-        weight_cfg = cfg["quant_cfg"][".*weight"]
-        weight_cfg["group_size"] = group_size
-        weight_cfg["symmetric"] = symmetric
-        weight_cfg["per_channel"] = per_channel
-        return cfg
+        clean = pattern.replace("re:", "").strip()
+        while clean.startswith(".*"):
+            clean = clean[2:]
+        while clean.endswith(".*"):
+            clean = clean[:-2]
+        clean = clean.strip(".")
+        return f"*{clean}*" if clean else "*"
 
     def _apply_quantization(self, quant_cfg: Dict[str, Any]) -> None:
         """Apply ModelOpt quantization with calibration forward loop.

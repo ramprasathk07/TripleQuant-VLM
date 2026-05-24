@@ -21,6 +21,7 @@ scheme:
 
 calibration:
   dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
   num_samples: 256
   max_seq_len: 1024
   seed: 42
