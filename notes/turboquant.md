@@ -3,6 +3,12 @@
 **Scope:** weeks 2–3 of the 3-week sprint (see `plan.md`).
 **Goal:** ship a working TurboQuant KV-cache quantizer for Llama-3-8B with Triton-fused decode attention, beating FP16 tok/s at ctx ≥ 8K.
 
+> **Known issue (2026-05-27):** `src/turboquant/quantize.py` `TMSE.quantize`/`dequantize`
+> reference an undefined `self.Pi`, while the rotation buffer is registered under the
+> mis-typed name `"RotateMatirx"` → `AttributeError` on any call. Fix: register the buffer
+> as `Pi` (or update the references) and correct the typo. Owner: user. Blocks the Week-2
+> correctness gate.
+
 **Source material:**
 - TurboQuant paper: Zandieh, Daliri, Hadian, Mirrokni — *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate* (arXiv 2504.19874, ICLR 2026).
 - PolarQuant paper: arXiv 2502.02617 (AISTATS 2026).

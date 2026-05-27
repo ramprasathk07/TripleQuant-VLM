@@ -1,10 +1,10 @@
 # TripleQuant-VLM — Execution Plan (3-Week Sprint)
 
-**Updated:** 2026-05-22
+**Updated:** 2026-05-27
 **Deadline:** 2026-06-12 (3 weeks)
 **Time split:** Week 1 → quantization pipeline polish · Week 2 → TurboQuant (PyTorch reference) · Week 3 → kernel optimization (Triton)
 
-Companion doc: `notes/turboquant.md` (algorithm + kernel deep-dive).
+Companion doc: `notes/turboquant.md` (algorithm + kernel deep-dive), `notes/benchmark.md` (eval/runtime/tracking).
 
 ---
 
@@ -14,40 +14,56 @@ Companion doc: `notes/turboquant.md` (algorithm + kernel deep-dive).
 
 | Component | File | Status |
 |---|---|---|
-| Pydantic v2 schemas | `src/config/schemas.py` | ✅ Done — `QuantizeConfig`, `SchemeConfig`, `CalibrationConfig`, `OutputConfig`, `SmoothQuantConfig`, `AWQParams`, `GPTQParams`. Method-vs-scheme cross-validator works. |
-| YAML loader | `src/config/loader.py` | ⚠️ Imports `BenchmarkConfig` but symbol does not exist in `schemas.py`. **Import error at runtime.** |
+| Pydantic v2 schemas | `src/config/schemas.py` | ✅ `QuantizeConfig` + family; `BenchmarkConfig`, `BenchmarkModelEntry` (+ runtime knobs `dtype`/`device_map`/`trust_remote_code`/`tensor_parallel_size`/`hf_quantization` + `is_vlm` property), `runtimes` selector, `MetricsConfig`, `EvalDatasetConfig`, `LatencyConfig`, `TrackingConfig`. |
+| YAML loader | `src/config/loader.py` | ✅ `load_quantize_config` + `load_benchmark_config`. `src/config/__init__.py` re-exports both. |
 | Registry | `src/quantization/registry.py` | ✅ Done. |
-| BaseQuantizer | `src/quantization/base.py` | ✅ VLM/LLM dispatch via `model_type` (no string sniff). Save() builds descriptive subfolder. |
-| LLM-Compressor adapter | `src/quantization/llm_compressor.py` | ✅ AWQ + GPTQ + PTQ + SmoothQuant unified through `_build_recipe`. Vision-tower ignore auto-merged. Dataset auto-detect (chat vs image-text). |
-| ModelOpt adapter | `src/quantization/modelOpy.py` | ⚠️ Exists, **not wired into factory** (commented out). NVFP4/MXFP4 use hand-rolled config dicts, not `mtq.NVFP4_DEFAULT_CFG`. Untested. |
-| Factory | `src/quantization/factory.py` | ✅ Routes on `backend`. ModelOpt branch commented out. |
-| AWQ class | `src/quantization/awq.py` | ⚠️ Stub only — no `quantize()` body. Actual AWQ now lives inside `LLMCompressorQuantizer`. **Class is dead code; delete or fold.** |
-| Entry point | `quantize.py` | ✅ Wired: load YAML → validate → factory → `load_model` → `quantize`. |
-| Configs | `config/quantize/*.yaml` | ✅ 7 configs: TinyLlama-1B (llmcomp+modelopt), Qwen2.5-VL-3B/7B (awq/gptq), SmolVLM2, nanoLLaVA. |
-| Generate/eval test | `tests/simple_generate.py` | ✅ Loads compressed model, prompts, prints VRAM/throughput. LLM only (no VLM eval, no PPL, no CER/WER). |
+| BaseQuantizer | `src/quantization/base.py` | ✅ VLM/LLM dispatch via `model_type`. `_is_vlm`/`_get_vision_ignore_patterns`/`_merged_ignore` lifted to base. Save() builds descriptive subfolder. |
+| LLM-Compressor adapter | `src/quantization/llm_compressor.py` | ✅ AWQ + GPTQ + PTQ + SmoothQuant via `_build_recipe`. Vision-tower ignore auto-merged. |
+| ModelOpt adapter | `src/quantization/modelopt.py` | ✅ Renamed from `modelOpy.py`, **wired into factory**, rewritten for **modelopt 0.44 list-based `quant_cfg` API** (scheme→default-cfg map + AWQ variants + `block_sizes` patch + glob ignore). TinyLlama-1B AWQ-W4A16 runs (CPU-ext fallback on Windows). |
+| Factory | `src/quantization/factory.py` | ✅ Routes on `backend`; ModelOpt branch active w/ lazy import + install hint. |
+| Runtimes | `src/runtimes/{base,factory,hf_runtime,vllm_runtime}.py` | ✅ `RuntimeBase` contract; `HFRuntime` (logits/PPL/VLM/latency/throughput, left-padding) + `VLLMRuntime` (throughput/latency, logits unsupported). `build_runtime(name, entry)` reads `BenchmarkModelEntry` directly. |
+| Eval — LLM | `src/evaluation/eval_llm.py` | ✅ `compute_ppl` (HF-only, logit-gated), `eval_mmlu_tiny`, `eval_logit_kl`, `eval_token_agreement`, `run_llm_eval`. |
+| Eval — OCR | `src/evaluation/eval_ocr.py` | ✅ CER/WER/EM/BLEU, per-sample report, JSON export. Honors `dataset_name`. |
+| Eval utils | `src/utils/{utils,hardware}.py` | ✅ HF dataset loaders, LaTeX normalize, prompt builder, GPU arch detect. |
+| Benchmark entry | `benchmark.py` | ✅ Rewritten: dual-runtime loop, capability-routed metric groups, crash-safe per-(model,runtime) JSON + comparison summary, `skip_on` arch filter, `--dry-run`. |
+| Entry point | `quantize.py` | ✅ load YAML → validate → factory → `load_model` → `quantize`. |
+| Configs | `config/quantize/*.yaml`, `config/benchmark/{ocr,llm}_comparison.yaml` | ✅ quant configs + 2 benchmark configs (LLM + VLM/OCR). |
 
 ### Empty / missing
 
 | Item | Status |
 |---|---|
-| `src/quantization/__init__.py`, `fp16.py` | empty |
-| `src/config/__init__.py`, `src/__init__.py`, `src/data/__init__.py`, `src/integrations/__init__.py` | empty |
-| `src/data/calibration.py`, `dataloader.py` | empty (logic lives inline in `llm_compressor.py`) |
-| `src/integrations/wandb_logger.py` | empty |
-| `BenchmarkConfig` schema | not defined (breaks `loader.py`) |
-| `benchmark.py` entry | not present |
-| `arch_profiles.py`, `schemes.py` | not built — single-file dispatch in `llm_compressor.py` |
-| Pruning / distillation / sparsity | not started |
-| TurboQuant | only enum value `"turboquant"` in `MethodLiteral` — no impl |
+| `src/tracking/` | empty — `TrackingConfig` defined, no W&B/Langfuse/MLflow impl yet. Benchmark writes local JSON only. |
+| `src/data/calibration.py`, `dataloader.py` | empty (calibration logic inline in adapters). |
+| `src/quantization/fp16.py` | present, registered? (baseline identity quantizer — verify wired). |
+| `arch_profiles.py` | not built — single-file dispatch in `llm_compressor.py`. |
+| `eval_logit_kl` / `eval_token_agreement` in benchmark | stubbed in `benchmark.py` (`{"skipped": "requires baseline wiring"}`). Functions exist in `eval_llm.py`; need baseline-runtime capture loop. |
+| Pruning / distillation / sparsity | not started (v2 scope). |
+| TurboQuant | impl present in `src/turboquant/` but **`TMSE` broken** (see bugs). |
 
-### Bugs / risks to fix before adding new code
+### Bugs / risks
 
-1. `loader.py` imports `BenchmarkConfig` which doesn't exist → any `from src.config.loader import …` will explode. Either delete `load_benchmark_config` or add `BenchmarkConfig` (matches `BenchmarkModelEntry` already in schemas).
-2. `awq.py` is dead. Remove or implement `quantize()` to call `LLMCompressorQuantizer` — current state is a trap.
-3. `modelOpy.py` `_get_nvfp4_cfg` / `_get_mxfp4_cfg` build dicts that `mtq.quantize` will reject. Use `mtq.NVFP4_DEFAULT_CFG.copy()` and override fields, like the INT4/INT8 branches do.
-4. `modelOpy.py` factory branch commented — `backend: modelopt` configs currently raise `ValueError`.
-5. `OutputConfig(output_dir: Path)` has no default, but `QuantizeConfig.output: OutputConfig = Field(default_factory=OutputConfig)` will fail validation when YAML omits `output`. Either make `output_dir` `Optional` or drop the default factory.
-6. `_load_calibration_dataset` in `llm_compressor.py` passes `split=f"{split}[:{n}]"` — fine for HF but breaks when YAML user already added a slice.
+1. ~~`loader.py` imports missing `BenchmarkConfig`~~ → **FIXED** (schema exists, `__init__` exports).
+2. ~~`awq.py` dead code~~ → AWQ lives in `LLMCompressorQuantizer` + modelopt path.
+3. ~~`modelOpy` NVFP4/MXFP4 hand-rolled dicts~~ → **FIXED**: modelopt 0.44 list-API, `mtq.*_CFG` defaults + patch.
+4. ~~`modelOpy` factory branch commented~~ → **FIXED**: active.
+5. ~~`OutputConfig` default~~ → **FIXED**: `output_dir` has default.
+6. ~~`split` slice double-append~~ → **FIXED**: guarded `"[:" in split`.
+7. **TurboQuant `TMSE` broken** (`src/turboquant/quantize.py`): buffer registered as `"RotateMatirx"` but `quantize`/`dequantize` reference undefined `self.Pi` → AttributeError. Owner: user (left alone per request).
+8. **Windows: `modelopt_cuda_ext` won't JIT** (no MSVC `cl.exe`) → AWQ runs on slow CPU fallback. Install VS C++ Build Tools to enable.
+9. **vLLM runtime untested on Windows** — vLLM dropped from `setup.bat` (torch-pin conflict). Run vLLM path in separate env.
+
+### Remaining work (snapshot 2026-05-27)
+
+Ordered by unblock value:
+
+1. **Smoke-run the benchmark** end-to-end on TinyLlama (HF runtime) via `config/benchmark/llm_comparison.yaml` — confirm PPL + MMLU + ttft/tpot + throughput + memory all produce numbers and JSON saves. (Currently only `--dry-run` validated.)
+2. **Wire `eval_logit_kl` + `eval_token_agreement`** into `benchmark.py`: when `config.baseline` set, load baseline runtime once, capture baseline logits/outputs on a fixed prompt set, pass into the metric fns. Currently stubbed as skipped.
+3. **Trackers** (`src/tracking/`): implement W&B + MLflow + Langfuse loggers per `notes/benchmark.md §12b`; honor `TrackingConfig.enabled`; additive to local JSON. NoOp fallback when creds missing.
+4. **fp16 baseline quantizer** — verify `fp16.py` is `@register`-ed and has a benchmark config (reference point for quality deltas).
+5. **`arch_profiles.py`** (Week1 Day5) — `sequential_targets` + Mamba/MoE ignore patterns, wire into `llm_compressor._build_recipe`.
+6. **TurboQuant `TMSE` fix** (user-owned) — `self.Pi` vs `RotateMatirx` buffer mismatch.
+7. **vLLM path validation** in an isolated env (separate from modelopt env).
 
 ---
 
@@ -56,6 +72,8 @@ Companion doc: `notes/turboquant.md` (algorithm + kernel deep-dive).
 ### Week 1 (May 22 → May 28) — Pipeline polish + benchmark + ModelOpt FP8
 
 Goal: every config in `config/quantize/` runs end-to-end on both backends, produces a vLLM-loadable checkpoint, and a single eval script reports PPL + latency + file size.
+
+**Status (May 27):** Day 1 blockers ✅ · Day 3 ModelOpt (0.44 API) ✅ · Day 4 benchmark harness ✅ (richer than planned — dual-runtime + OCR + perf + memory). Remaining: smoke-run benchmark, trackers, arch_profiles, fp16 baseline verify. See "Remaining work" above.
 
 | Day | Task |
 |---|---|
@@ -108,37 +126,40 @@ Goal: fused decode kernel that beats FP16 baseline on tok/s at long context (≥
 ```
 src/
   config/
-    schemas.py        # + BenchmarkConfig, + TurboQuantConfig
-    loader.py
+    schemas.py        # ✅ Quantize* + Benchmark* + Metrics/Eval/Latency/Tracking
+    loader.py         # ✅ load_quantize_config + load_benchmark_config
+    __init__.py       # ✅ re-exports loaders + configs
   quantization/
-    base.py
-    registry.py
-    factory.py
-    fp16.py           # baseline (NEW)
-    llm_compressor.py # AWQ/GPTQ/PTQ/SmoothQuant
-    modelOpy.py       # FP8/NVFP4/MXFP4 (FIXED)
-    arch_profiles.py  # tiny — sequential_targets + ignore (NEW)
-  turboquant/         # NEW — week 2-3
-    __init__.py
-    codebook.py       # Lloyd-Max + cache
-    rotation.py       # orthogonal Π + QJL S
-    quantizer.py      # TurboQuantMSE / TurboQuantProd
-    pack.py           # bit-packing helpers
-    kv_cache.py       # capture hooks + compressed store
-    attention.py      # Python ref decode-step attention
-    triton_kernels.py # NEW week 3
-    integration/
-      hf_llama.py     # monkey-patch shim
-  evaluation/         # NEW — week 1
-    metrics.py        # PPL, latency, VRAM, file size
-    ocr_cer.py        # VLM accuracy (Qwen2.5-VL)
-  data/
-    calibration.py    # extracted from llm_compressor.py
-benchmark.py          # NEW
-quantize.py           # existing
+    base.py           # ✅ shared VLM helpers lifted here
+    registry.py       # ✅
+    factory.py        # ✅ modelopt branch active
+    fp16.py           # baseline identity (verify @register wired)
+    llm_compressor.py # ✅ AWQ/GPTQ/PTQ/SmoothQuant
+    modelopt.py       # ✅ FP8/NVFP4/MXFP4/INT — modelopt 0.44 list-API
+    arch_profiles.py  # TODO (week1 day5) — sequential_targets + ignore
+  runtimes/           # ✅ NEW — dual-runtime benchmarking
+    base.py           # RuntimeBase contract
+    factory.py        # build_runtime(name, entry)
+    hf_runtime.py     # HF: logits/PPL/VLM/latency/throughput
+    vllm_runtime.py   # vLLM: throughput/latency (no logits)
+  evaluation/         # ✅ NEW
+    eval_llm.py       # PPL, MMLU, logit-KL, token-agree
+    eval_ocr.py       # CER/WER/EM/BLEU + per-sample report
+  utils/              # ✅ NEW
+    utils.py          # dataset loaders, LaTeX norm, prompt builder
+    hardware.py       # GPU vendor/arch/VRAM detect
+  tracking/           # ⬜ empty — W&B/Langfuse/MLflow TODO
+  turboquant/         # ⚠️ present; TMSE broken (self.Pi) — user-owned
+    quantize.py kv_cache.py lloyd_codebook.py rotations.py memory.py
+  data/               # ⬜ calibration.py/dataloader.py empty (inline for now)
+benchmark.py          # ✅ rewritten — dual-runtime, crash-safe, summary
+quantize.py           # ✅
+config/
+  quantize/*.yaml
+  benchmark/ocr_comparison.yaml   # ✅ VLM/OCR
+  benchmark/llm_comparison.yaml   # ✅ text LLM (ppl+mmlu+perf+mem)
 notes/
-  plan.md             # this file
-  turboquant.md       # algorithm + kernel deep-dive
+  plan.md  benchmark.md  kernel_scope.md  turboquant.md
 ```
 
 ---

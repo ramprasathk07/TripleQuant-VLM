@@ -35,11 +35,11 @@ class ModelOptQuantizer(BaseQuantizer):
         self._calib_dataloader = None
 
     def quantize(self) -> None:
-        """Run NVIDIA ModelOpt quantization with configured scheme and observer.
+        """Run NVIDIA ModelOpt quantization with the configured scheme.
 
-        Orchestrates: calibration dataloader preparation, quantization config
-        building (scheme mapping + observer selection), apply_quantization with
-        forward loop, and model export.
+        Orchestrates: calibration dataloader preparation, quant_cfg building
+        (scheme -> modelopt default + group_size/ignore patching), quantization
+        with calibration forward loop, and model export.
         """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
@@ -60,7 +60,7 @@ class ModelOptQuantizer(BaseQuantizer):
 
         Assumes chat-format datasets with optional image fields for VLMs.
         Preprocesses to input_ids, attention_mask, and optionally pixel_values
-        via apply_chat_template. Prepares dataloader via get_dataset_dataloader.
+        via apply_chat_template, then wraps in a torch DataLoader (batch_size=1).
 
         Raises:
             ValueError: If no tokenizer/processor is available.

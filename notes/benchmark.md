@@ -1,9 +1,59 @@
 # Benchmark Pipeline — Design & Implementation Plan
 
-**Updated:** 2026-05-22
+**Updated:** 2026-05-27
 **Scope:** unified eval harness for quantized models from both `llmcompressor` and `modelopt` backends. Two hardware targets: **RTX 3060 (12GB Ampere)** and **AMD MI300X (192GB CDNA3, ROCm)**. Two task families: **LLM text** (PPL + MMLU-tiny) and **OCR** (CER/WER on LaTeX_OCR, TextOCR).
 
 Companion docs: `notes/plan.md` (sprint schedule), `notes/turboquant.md` (kernel work).
+
+> **§§3–12 below are the original design.** Sections describing schema field names,
+> file layout, and runner signatures predate the build — see **§0 Implementation Status**
+> for what actually shipped and where it diverged.
+
+---
+
+## 0. Implementation Status (2026-05-27)
+
+### Built & wired ✅
+
+| Design ref | Shipped as | Notes |
+|---|---|---|
+| §4.1 file layout | `src/runtimes/`, `src/evaluation/`, `src/utils/` | Eval split into `eval_llm.py` + `eval_ocr.py` (not `metrics.py`/`ocr_cer.py`). Runtimes top-level `src/runtimes/` (not `src/evaluation/runtimes/`). |
+| §4.2 BenchmarkConfig | `src/config/schemas.py` | Field names differ from design — see divergences. |
+| §6.1 PPL | `eval_llm.compute_ppl` | HF-only (logit-gated); raises on vLLM. |
+| §6.2 MMLU | `eval_llm.eval_mmlu_tiny` | + `score_choices` on both runtimes. |
+| §6.3 OCR CER | `eval_ocr.eval_ocr` | CER/WER/EM/BLEU + `report_ocr_failures` + `save_ocr_results`. |
+| §6.4/6.5 dual runtime | `src/runtimes/{base,factory,hf,vllm}.py` | `build_runtime(name, entry)`; HF=quality+perf, vLLM=perf. |
+| §6.6 hardware detect | `src/utils/hardware.py` | `detect_hw()`, `get_gpu_arch()`. |
+| Runner | `benchmark.py` | Dual-runtime loop, capability-routed metric groups, crash-safe per-(model,runtime) JSON + comparison summary + table. |
+| Configs | `config/benchmark/{ocr,llm}_comparison.yaml` | OCR (VLM) + text LLM. |
+
+### Divergences from design (intentional)
+
+- **No `RuntimeConfig` nested object.** Runtime knobs live flat on `BenchmarkModelEntry` (`dtype`, `device_map`, `trust_remote_code`, `tensor_parallel_size`, `hf_quantization`) + `is_vlm` property. Single source of truth; runtimes read the entry directly.
+- **Runtime selection** via top-level `BenchmarkConfig.runtimes: ["hf"|"vllm"]` (not per-model `skip_hf_runtime`).
+- **`MetricsConfig`** uses lists (`quality_llm`, `quality_ocr`, `perf`, `memory`) not booleans.
+- **Output dir** = `output_root / run_name /` (per-(model,runtime) JSON + `comparison_summary_*.json`).
+- HF tokenizer forced `padding_side="left"` for correct batched decode.
+
+### Not yet implemented ⬜ (remaining)
+
+1. **Trackers** (§7b, §12b) — `src/tracking/` empty. `TrackingConfig` parsed but unused; benchmark writes **local JSON only**. Need `TrackerBase`/`CompositeTracker` + W&B/Langfuse/MLflow + NoOp fallback.
+2. **logit_kl / token_agree** — functions exist in `eval_llm.py` but benchmark **stubs them** (`{"skipped": "requires baseline wiring"}`). Need baseline-runtime capture when `config.baseline` set.
+3. **Auto-enqueue** (§5) — no `benchmark_queue.yaml`; run configs explicitly via `-c`.
+4. **Plots** (§7) — no matplotlib PNG generation yet; JSON only.
+5. **Context-length sweep** (§3.4) — `LatencyConfig.ctx_sweep` parsed, not consumed by runner.
+6. **End-to-end smoke run** — only `--dry-run` validated; no real GPU run logged yet.
+
+### How to run now
+
+```bash
+# text LLM: PPL + MMLU + ttft/tpot + throughput + memory (HF runtime)
+python benchmark.py -c config/benchmark/llm_comparison.yaml
+# VLM OCR: CER/WER/EM/BLEU + perf + memory
+python benchmark.py -c config/benchmark/ocr_comparison.yaml
+# validate config only
+python benchmark.py -c <cfg> --dry-run
+```
 
 ---
 

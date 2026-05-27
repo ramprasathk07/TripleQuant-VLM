@@ -204,45 +204,91 @@ class QuantizeConfig(BaseModel):
         return self
 
 
+class MetricsConfig(BaseModel):
+    quality_llm: list[Literal["ppl", "mmlu_tiny", "logit_kl", "token_agree"]] = ["ppl"]
+    quality_ocr: list[Literal["cer", "wer", "exact_match", "bleu"]] = ["cer"]
+    perf:        list[Literal["ttft", "tpot", "throughput", "ctx_sweep"]] = ["throughput", "ttft", "tpot"]
+    memory:      list[Literal["disk", "vram", "load_time"]] = ["disk", "vram"]
+
+class EvalDatasetConfig(BaseModel):
+    ppl_dataset: str = "wikitext"
+    ppl_subset: str = "wikitext-2-raw-v1"
+    mmlu_subjects: list[str] = ["high_school_mathematics", "computer_science",
+                                "philosophy", "world_history", "global_facts"]
+    ocr_dataset: str = "linxy/LaTeX_OCR"
+    ocr_num_samples: int = 500
+    ocr_max_new_tokens: int = 256
+
+class LatencyConfig(BaseModel):
+    prompt_lens: list[int] = [512]
+    output_lens: list[int] = [128]
+    batch_sizes: list[int] = [1, 4, 8, 16]
+    ctx_sweep:   list[int] = [512, 2048, 8192]
+    num_requests: int = 100
+    warmup_requests: int = 5
+
 class BenchmarkModelEntry(BaseModel):
-    """Single model entry for benchmarking with vLLM serving configuration."""
     name: str
-    path: str
+    path: str                     # local dir or HF id
     is_local: bool = False
+    is_compressed: bool = True    # save_compressed=True flag
+    model_type: ModelTypeLiteral = "llm"   # 'llm' | 'vlm'
+    backend_hint: Optional[Literal["llm_compressor", "modelopt"]] = None
+    vllm_quantization: Optional[str] = None  # 'compressed-tensors', 'modelopt', 'modelopt_fp4'
     gpu_memory_utilization: float = 0.85
     max_model_len: int = 4096
+    skip_on: list[str] = []       # e.g., ["sm_86"] to skip on 3060
 
+    # ── Runtime loading knobs (consumed directly by HFRuntime / VLLMRuntime) ──
+    dtype: str = "auto"                       # 'auto' | 'bfloat16' | 'float16' | 'float32'
+    device_map: str = "auto"                  # HF device placement
+    trust_remote_code: bool = False
+    tensor_parallel_size: int = 1             # vLLM multi-GPU
+    hf_quantization: Optional[str] = None     # HF on-the-fly BnB: None | 'int8' | 'int4' | 'nf4'
+
+    @property
+    def is_vlm(self) -> bool:
+        """True if this entry describes a vision-language model."""
+        return self.model_type == "vlm"
 
 class TrackingConfig(BaseModel):
-    """Experiment tracking and result logging configuration for benchmarks.
+    """Multi-backend experiment tracking. Local PNG always written; trackers are additive."""
+    enabled: list[Literal["wandb", "langfuse", "mlflow"]] = ["wandb", "mlflow"]
 
-    Supports Weights and Biases (wandb), Langfuse, and MLflow integrations
-    with local fallback to filesystem output.
-    """
-    wandb_project: Optional[str] = None
+    # W&B
+    wandb_project: str = "triplequant-vlm"
     wandb_entity: Optional[str] = None
-    langfuse_enabled: bool = False
-    mlflow_tracking_uri: Optional[str] = None
-    mlflow_experiment: str = "TripleQuant-VLM"
-    local_output_dir: Path = Path("./benchmark_results")
+    wandb_tags: list[str] = []
+    wandb_public: bool = True              # use public W&B project (shareable URL)
+    wandb_api_key_env: str = "WANDB_API_KEY"
 
-    @field_validator("local_output_dir", mode="before")
-    @classmethod
-    def _coerce_path(cls, v) -> Path:
-        return Path(v).expanduser()
+    # Langfuse — for OCR per-sample LLM traces (prompt, image, pred, CER score)
+    langfuse_project: str = "triplequant-ocr"
+    langfuse_host: str = "https://cloud.langfuse.com"
+    langfuse_public_key_env: str = "LANGFUSE_PUBLIC_KEY"
+    langfuse_secret_key_env: str = "LANGFUSE_SECRET_KEY"
+    langfuse_only_ocr: bool = True         # don't trace PPL eval (too many calls, no value)
 
+    # MLflow
+    mlflow_tracking_uri: str = "file:./mlruns"     # local default; can be http://mlflow-server
+    mlflow_experiment: str = "triplequant-bench"
+    mlflow_register_model: bool = False    # only set True for "release" runs
+
+    # Common
+    log_per_sample_predictions: bool = False  # writes every OCR pred to tracker (heavy)
+    log_artifacts: bool = True              # PNG + CSV uploaded
+    offline_mode: bool = False              # fall back to NoOpTracker if creds missing
 
 class BenchmarkConfig(BaseModel):
-    """Benchmark task configuration for vLLM serving evaluation.
-
-    Specifies models to benchmark, evaluation tasks (text, OCR), calibration dataset,
-    and tracking/logging destinations for results.
-    """
-    models: List[BenchmarkModelEntry] = Field(default_factory=list)
-    tasks: List[str] = Field(default_factory=lambda: ["text", "ocr"])
-    dataset_name: str = "HuggingFaceH4/ultrachat_200k"
-    ocr_dataset_name: str = "linxy/LaTeX_OCR"
-    num_samples: int = 100
-    max_new_tokens: int = 256
+    run_name: str
+    output_root: Path = Path("./results")
+    models: list[BenchmarkModelEntry]
+    baseline: Optional[BenchmarkModelEntry] = None  # for delta metrics
+    runtimes: list[Literal["hf", "vllm"]] = ["hf"]   # run each model on these runtimes
+    metrics: MetricsConfig = MetricsConfig()
+    datasets: EvalDatasetConfig = EvalDatasetConfig()
+    latency: LatencyConfig = LatencyConfig()
+    tracking: TrackingConfig = TrackingConfig()
+    crash_safe: bool = True
     seed: int = 42
-    tracking: TrackingConfig = Field(default_factory=TrackingConfig)
+    hf_token_env: str = "HF_TOKEN"

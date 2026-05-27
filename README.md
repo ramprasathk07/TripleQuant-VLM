@@ -9,24 +9,43 @@ Production-grade quantization + benchmarking pipeline for LLMs and Vision-Langua
 ```
 TripleQuant-VLM/
 ├── quantize.py                  # CLI: quantize a model from YAML config
+├── benchmark.py                 # CLI: dual-runtime benchmark (HF + vLLM), crash-safe
+├── setup.bat                    # Windows env builder (torch 2.8 cu128 + llmcompressor + modelopt)
 ├── tests/
 │   └── simple_generate.py       # Load + test / compare / chat with quantized model
 ├── src/
 │   ├── config/
-│   │   ├── schemas.py           # Pydantic v2: QuantizeConfig, SchemeConfig, CalibrationConfig …
-│   │   └── loader.py            # YAML → validated config
+│   │   ├── schemas.py           # Pydantic v2: Quantize* + Benchmark* + Metrics/Latency/Tracking
+│   │   ├── loader.py            # YAML → validated config (quantize + benchmark)
+│   │   └── __init__.py          # re-exports loaders + configs
 │   ├── quantization/
-│   │   ├── base.py              # BaseQuantizer: VLM/LLM loader, save()
+│   │   ├── base.py              # BaseQuantizer: VLM/LLM loader, vision-ignore, save()
 │   │   ├── factory.py           # get_quantizer() — routes on config.backend
 │   │   ├── llm_compressor.py    # AWQ / GPTQ / PTQ / SmoothQuant via llmcompressor
-│   │   ├── modelOpy.py          # FP8 / NVFP4 / MXFP4 / INT4/INT8 via nvidia-modelopt
+│   │   ├── modelopt.py          # FP8 / NVFP4 / MXFP4 / INT via nvidia-modelopt (0.44 API)
+│   │   ├── fp16.py              # FP16 baseline identity quantizer
 │   │   └── registry.py          # @register("method") decorator registry
-│   ├── data/                    # calibration + dataloader (in progress)
-│   └── integrations/            # W&B logger (in progress)
-├── config/quantize/             # Ready-to-run YAML configs (see below)
+│   ├── runtimes/                # Inference backends for benchmarking
+│   │   ├── base.py              # RuntimeBase contract
+│   │   ├── factory.py           # build_runtime(name, entry)
+│   │   ├── hf_runtime.py        # HF: logits/PPL/VLM/latency/throughput
+│   │   └── vllm_runtime.py      # vLLM: throughput/latency (logits unsupported)
+│   ├── evaluation/
+│   │   ├── eval_llm.py          # PPL, MMLU-tiny, logit-KL, token-agreement
+│   │   └── eval_ocr.py          # CER / WER / Exact-Match / BLEU + per-sample report
+│   ├── utils/
+│   │   ├── utils.py             # dataset loaders, LaTeX normalize, prompt builder
+│   │   └── hardware.py          # GPU vendor / arch / VRAM detection
+│   ├── turboquant/              # KV-cache quantization (WIP — see notes/turboquant.md)
+│   ├── tracking/                # W&B / Langfuse / MLflow loggers (TODO — empty)
+│   └── data/                    # calibration + dataloader (inline in adapters for now)
+├── config/
+│   ├── quantize/                # Ready-to-run quantization configs (see below)
+│   └── benchmark/               # ocr_comparison.yaml (VLM), llm_comparison.yaml (text)
 └── notes/
     ├── plan.md                  # 3-week sprint plan + current-state audit
-    ├── benchmark.md             # Benchmark pipeline design (W&B / Langfuse / MLflow)
+    ├── benchmark.md             # Benchmark pipeline design + impl status (§0)
+    ├── kernel_scope.md          # Triton / TileLang kernel optimization scope
     └── turboquant.md            # TurboQuant algorithm + Triton kernel plan
 ```
 
@@ -37,7 +56,9 @@ TripleQuant-VLM/
 | Backend | Methods | Schemes | vLLM load flag |
 |---|---|---|---|
 | `llm_compressor` | AWQ, GPTQ, PTQ, SmoothQuant | W4A16, W4A16_ASYM, W8A8, W8A16, FP8, FP8_DYNAMIC | `compressed-tensors` |
-| `modelopt` | AWQ, PTQ | W4A16, W8A8, W8A16, FP8, FP8_DYNAMIC, FP8_BLOCK, NVFP4, MXFP4 | `modelopt` / `modelopt_fp4` |
+| `modelopt` | AWQ, PTQ | W4A16, W8A16, W8A8, FP8, FP8_DYNAMIC, FP8_KV, NVFP4, MXFP4, MXFP6, MXFP8, MXINT8 | `modelopt` / `modelopt_fp4` |
+
+> ModelOpt schemes map to `nvidia-modelopt` 0.44 default configs; AWQ variants used automatically for `W4A16`/`NVFP4` when `method: awq`.
 
 **Hardware floor:**
 
@@ -52,12 +73,23 @@ TripleQuant-VLM/
 
 ## Installation
 
+Pin a matched torch triplet — mixing torch/torchvision versions breaks `torchvision::nms`:
+
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-pip install llmcompressor compressed-tensors pydantic>=2 transformers datasets pyyaml
-# For modelopt backend (optional):
-pip install nvidia-modelopt[torch]
+# Matched torch triplet (ABI must agree)
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+pip install "transformers>=4.51,<4.56" "datasets>=3,<4" accelerate pyyaml "pydantic>=2"
+pip install llmcompressor==0.6.0 compressed-tensors==0.10.2
+# For modelopt backend (FP8/NVFP4/INT4) — torch extras only, NOT [all]:
+pip install "nvidia-modelopt[torch]==0.44.0"
+# For benchmarking eval metrics:
+pip install jiwer nltk pillow
 ```
+
+> A local `setup.bat` (Windows, gitignored) automates the above on a clean Python 3.12 venv.
+> **vLLM** is intentionally not installed alongside modelopt (torch-pin conflict). Install it in a **separate venv** for the vLLM runtime: `pip install "vllm>=0.10,<0.12"`.
+> **Windows AWQ note:** `modelopt_cuda_ext` needs MSVC `cl.exe` to JIT-compile; without VS C++ Build Tools it falls back to a slower (still-correct) CPU path.
 
 ---
 
@@ -155,7 +187,35 @@ Reports: load time, disk size, VRAM usage, tok/s per prompt.
 
 ---
 
-## 3. Serve with vLLM
+## 3. Benchmark Models
+
+Runs each model on the selected runtime(s) and reports quality + performance + memory, saving crash-safe per-(model, runtime) JSON plus a comparison summary.
+
+```bash
+# Text LLM: perplexity + MMLU-tiny + TTFT/TPOT + throughput + memory
+python benchmark.py -c config/benchmark/llm_comparison.yaml
+
+# VLM OCR: CER / WER / Exact-Match / BLEU + perf + memory
+python benchmark.py -c config/benchmark/ocr_comparison.yaml
+
+# Validate config + print plan without loading models
+python benchmark.py -c config/benchmark/llm_comparison.yaml --dry-run
+```
+
+**Runtimes** (set `runtimes: ["hf", "vllm"]` in the config):
+
+| Runtime | Quality (PPL, logit-KL) | MMLU / OCR | Latency / Throughput |
+|---|---|---|---|
+| `hf` (HuggingFace) | ✅ (needs raw logits) | ✅ / ✅ (VLM) | ✅ |
+| `vllm` | ❌ (logits hidden) | ✅ / ❌ | ✅ (production target) |
+
+PPL and OCR auto-skip on runtimes that cannot support them. Results land in `{output_root}/{run_name}/`.
+
+> Trackers (W&B / Langfuse / MLflow) are designed in `notes/benchmark.md` but not yet wired — the harness currently writes local JSON only.
+
+---
+
+## 4. Serve with vLLM
 
 ```bash
 # llmcompressor output (compressed-tensors format)
@@ -170,7 +230,7 @@ vllm serve ./output/model-nvfp4 --quantization modelopt_fp4
 
 ---
 
-## 4. Extending
+## 5. Extending
 
 **Add a new quantization method:**
 
@@ -198,15 +258,18 @@ Ignore patterns for vision towers and unsupported SSM layers are auto-detected i
 See `notes/plan.md` for the full day-by-day 3-week sprint. High-level:
 
 ### Week 1 (pipeline polish) — in progress
-- [ ] `fp16.py` baseline quantizer (`@register("fp16")`)
-- [ ] Fix `BenchmarkConfig` schema + `loader.py` import error
-- [ ] Enable `modelopt` backend in factory (currently commented out)
-- [ ] Fix NVFP4/MXFP4 config dicts to use `mtq.NVFP4_DEFAULT_CFG` (not hand-rolled)
+- [x] Fix `BenchmarkConfig` schema + `loader.py` import error
+- [x] Enable `modelopt` backend in factory + rewrite for modelopt 0.44 list-based `quant_cfg` API
+- [x] Benchmark harness (`benchmark.py`) — dual-runtime, PPL, MMLU, CER/WER, TTFT/TPOT, throughput, VRAM, disk
+- [x] Runtimes (`src/runtimes/`) — HF + vLLM behind a common `RuntimeBase`
+- [x] Eval modules (`src/evaluation/`) — `eval_llm` (PPL/MMLU/KL/agree), `eval_ocr` (CER/WER/EM/BLEU)
+- [x] VLM eval: CER/WER on LaTeX_OCR for Qwen2.5-VL configs
+- [ ] `fp16.py` baseline quantizer — verify `@register("fp16")` wired + add benchmark config
 - [ ] Arch profiles (`arch_profiles.py`) — MoE sequential targets, Mamba ignore
-- [ ] Benchmark harness (`benchmark.py`) — PPL, CER, TTFT, TPOT, VRAM, disk size
+- [ ] Wire `logit_kl` / `token_agree` into benchmark (baseline-runtime capture; currently stubbed)
 - [ ] Auto-enqueue: successful quantize run → appended to `benchmark_queue.yaml`
-- [ ] Eval tracking: W&B (plots + tables), Langfuse (OCR per-sample traces), MLflow (registry)
-- [ ] VLM eval: CER/WER on LaTeX_OCR for Qwen2.5-VL configs
+- [ ] Eval tracking: W&B (plots + tables), Langfuse (OCR per-sample traces), MLflow (registry) — `src/tracking/` empty
+- [ ] End-to-end benchmark smoke run on GPU (only `--dry-run` validated so far)
 
 ### Week 2 (TurboQuant — KV-cache quantization)
 - [ ] `src/turboquant/` — Lloyd-Max codebook, orthogonal rotation, bit-packing
