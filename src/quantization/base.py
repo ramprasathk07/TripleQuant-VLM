@@ -63,8 +63,14 @@ class BaseQuantizer(ABC):
             self._load_llm()
 
     def _load_vlm(self) -> None:
-        """Load vision-language model with AutoProcessor and AutoModelForImageTextToText."""
-        from transformers import AutoProcessor, AutoModelForImageTextToText
+        """Load a vision-language model + its AutoProcessor.
+
+        Tries auto-classes in order, then the config's explicit architecture class.
+        Needed because some VLMs (e.g. HunyuanOCR / HunYuanVLConfig) are not in the
+        AutoModelForImageTextToText mapping even though they ship a
+        ``*ForConditionalGeneration`` class.
+        """
+        from transformers import AutoProcessor
 
         processor_kwargs: dict = {}
         if self.config.model.min_pixels is not None:
@@ -72,18 +78,57 @@ class BaseQuantizer(ABC):
         if self.config.model.max_pixels is not None:
             processor_kwargs["max_pixels"] = self.config.model.max_pixels
 
-        logger.info("Detected VLM — loading AutoProcessor + AutoModelForImageTextToText")
+        logger.info("Detected VLM — loading AutoProcessor + VLM model")
         self.processor = AutoProcessor.from_pretrained(
             self.model_id,
             trust_remote_code=self.trust_remote_code,
             **processor_kwargs,
         )
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            self.model_id,
+        self.model = self._from_pretrained_vlm()
+
+    def _from_pretrained_vlm(self):
+        """Load the VLM weights via a fallback chain of model classes."""
+        import transformers
+        from transformers import (
+            AutoConfig, AutoModelForImageTextToText, AutoModelForCausalLM,
+        )
+
+        kw = dict(
             torch_dtype=self.torch_dtype,
             device_map=self.device_map,
             trust_remote_code=self.trust_remote_code,
         )
+
+        last_err: Exception | None = None
+        for loader in (AutoModelForImageTextToText, AutoModelForCausalLM):
+            try:
+                model = loader.from_pretrained(self.model_id, **kw)
+                logger.info("Loaded VLM via %s", loader.__name__)
+                return model
+            except (ValueError, KeyError) as e:
+                last_err = e
+                logger.warning("%s could not load this model — trying next loader.",
+                               loader.__name__)
+
+        # Last resort: the explicit architecture class named in the config
+        # (e.g. HunYuanVLForConditionalGeneration).
+        try:
+            cfg = AutoConfig.from_pretrained(
+                self.model_id, trust_remote_code=self.trust_remote_code,
+            )
+            arch = (getattr(cfg, "architectures", None) or [None])[0]
+            cls = getattr(transformers, arch, None) if arch else None
+            if cls is not None:
+                model = cls.from_pretrained(self.model_id, **kw)
+                logger.info("Loaded VLM via explicit class %s", arch)
+                return model
+            logger.error("Architecture '%s' not importable from transformers.", arch)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+
+        raise RuntimeError(
+            f"Could not load VLM '{self.model_id}' via any loader."
+        ) from last_err
 
     def _load_llm(self) -> None:
         """Load language model with AutoTokenizer and AutoModelForCausalLM."""

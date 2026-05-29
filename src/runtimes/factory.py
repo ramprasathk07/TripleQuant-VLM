@@ -58,7 +58,7 @@ def build_runtime(
         )
 
     runtime_cls = _REGISTRY[key]
-    logger.info(f"[factory] Building runtime '{key}' for model '{entry.model_id}'")
+    logger.info(f"[factory] Building runtime '{key}' for model '{entry.path}'")
 
     runtime = runtime_cls()
     runtime.load(entry)

@@ -1,22 +1,22 @@
 #!/usr/bin/env python
-"""
-benchmark.py — TripleQuant-VLM multi-model, dual-runtime benchmark entry point.
+"""Main entry point for multi-model, dual-runtime benchmarking.
 
-For every model in the config, runs the enabled metric groups on each selected
-runtime (HF and/or vLLM), saves per-(model, runtime) JSON immediately
-(crash-safe), then writes a final comparison summary.
+This module orchestrates benchmark runs over a set of VLMs/LLMs, evaluating each
+model on selected runtimes (HuggingFace, vLLM) with configurable metric suites.
+Results are saved incrementally per (model, runtime) pair and aggregated into a
+comparison summary. Metric routing respects runtime capabilities: perplexity
+requires logit access (HF only), OCR evals require VLM inference, and other
+metrics may run on both backends.
 
-Metric routing (a metric is skipped — with a logged note — when the runtime
-cannot support it):
-    quality_llm.ppl / logit_kl   → HF only (need raw logits; vLLM hides them)
-    quality_llm.mmlu_tiny        → HF + vLLM (log-prob scoring)
-    quality_ocr.*                → HF only, VLM models only (generate_vlm)
-    perf.*                       → HF + vLLM
-    memory.*                     → HF + vLLM
+Metric support matrix:
+  - quality_llm.ppl, logit_kl → HF only (logit access required)
+  - quality_llm.mmlu_tiny, gsm8k, aime, ceval, humaneval → HF and vLLM
+  - quality_ocr.* → HF only, VLM models only (generate_vlm method)
+  - perf.*, memory.* → HF and vLLM
 
 Usage:
-    python benchmark.py --config config/benchmark/ocr_comparison.yaml
-    python benchmark.py --config config/benchmark/ocr_comparison.yaml --dry-run
+  python benchmark.py --config config/benchmark/ocr_comparison.yaml
+  python benchmark.py --config config/benchmark/ocr_comparison.yaml --dry-run
 """
 from __future__ import annotations
 
@@ -46,29 +46,84 @@ _PERF_PROMPT = "Explain the theory of relativity in simple terms, step by step."
 _MMLU_Q_PER_SUBJECT = 50
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _safe_filename(name: str) -> str:
-    """Convert a display name into a safe filename stem."""
+    """Convert display name to filesystem-safe filename stem.
+
+    Lowercases and replaces spaces and slashes with underscores/dashes for
+    use in output file and directory names.
+
+    Args:
+        name: Display name (may contain spaces, slashes, uppercase).
+
+    Returns:
+        Safe filename stem (lowercase, spaces → underscores, slashes → dashes).
+    """
     return name.lower().replace(" ", "_").replace("/", "-")
 
 
 def _dir_size_mb(path: Path) -> float:
-    """Total size (MB) of all files under a directory, 0.0 if not a local dir."""
+    """Compute total disk size of a directory tree.
+
+    Recursively sums file sizes under the directory, excluding directory
+    entries themselves.
+
+    Args:
+        path: Directory path to measure.
+
+    Returns:
+        Total size in MB (rounded to 2 decimals), or 0.0 if path does not
+        exist or is not a directory.
+    """
     if not path.exists() or not path.is_dir():
         return 0.0
     total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
     return round(total / (1024 ** 2), 2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Metric groups (each is crash-safe at the caller level)
-# ─────────────────────────────────────────────────────────────────────────────
+def _resolve_checkpoint_dir(path: str) -> str:
+    """Resolve benchmark model path to actual checkpoint directory.
 
+    The quantize.py workflow saves models into subdirectories named
+    {model}-{backend}-{method}-{scheme}. If the provided path is a parent
+    directory lacking config.json but containing exactly one child with
+    config.json, descend into it. Supports both direct checkpoints and
+    their parent containers.
+
+    Args:
+        path: Checkpoint directory or parent container path.
+
+    Returns:
+        Resolved path to config.json directory (child if found, else original).
+    """
+    p = Path(path)
+    if not p.is_dir() or (p / "config.json").exists():
+        return path
+    subdirs = [d for d in p.iterdir() if d.is_dir() and (d / "config.json").exists()]
+    if len(subdirs) == 1:
+        logger.info("Resolved checkpoint dir: '%s' → '%s'", path, subdirs[0])
+        return str(subdirs[0])
+    return path
+
+
+# Metric groups (each is crash-safe at the caller level)
 def _run_quality_llm(runtime, runtime_name: str, config: BenchmarkConfig) -> dict:
-    """Run enabled LLM quality metrics (ppl, mmlu_tiny). Returns partial dict."""
+    """Compute text-quality metrics enabled for this benchmark run.
+
+    Dispatches to per-metric evaluators (perplexity, MMLU, GSM8K, AIME, C-Eval,
+    HumanEval) based on config.metrics.quality_llm. Skips logit-dependent metrics
+    on vLLM (which does not expose raw logits). Returns early-exit markers for
+    unimplemented metrics (logit_kl, token_agree).
+
+    Args:
+        runtime: Initialized model runtime (HF or vLLM).
+        runtime_name: "hf" or "vllm" for logging and conditional metric gating.
+        config: BenchmarkConfig controlling dataset params, seeds, sample counts.
+
+    Returns:
+        Dictionary mapping metric name (str) to result dict or skip marker.
+        Keys: "ppl", "mmlu_acc", "gsm8k", "aime", "ceval", "humaneval", etc.
+    """
     from src.evaluation.eval_llm import compute_ppl, eval_mmlu_tiny
     from src.utils import load_wikitext
 
@@ -95,6 +150,42 @@ def _run_quality_llm(runtime, runtime_name: str, config: BenchmarkConfig) -> dic
             seed=config.seed,
         )
 
+    # ── Reasoning / code / Chinese-MC evals (eval_tasks) ──────────────────────
+    # Generative (gsm8k/aime/humaneval) run on ANY runtime via generate(); C-Eval
+    # uses score_choices() which both HF and vLLM implement. Only ppl (above) is
+    # genuinely HF-only (needs raw logits).
+    ds = config.datasets
+    new_evals = {"gsm8k", "ceval", "humaneval", "aime"} & set(wanted)
+    if new_evals:
+        from src.evaluation.eval_tasks import (
+            eval_gsm8k, eval_ceval, eval_humaneval, eval_aime,
+        )
+        if "gsm8k" in wanted:
+            out["gsm8k"] = eval_gsm8k(
+                runtime, num_samples=ds.gsm8k_num_samples,
+                max_new_tokens=ds.gsm8k_max_new_tokens, seed=config.seed,
+                dataset_name=ds.gsm8k_dataset,
+            )
+        if "aime" in wanted:
+            out["aime"] = eval_aime(
+                runtime, num_samples=ds.aime_num_samples,
+                max_new_tokens=ds.aime_max_new_tokens, seed=config.seed,
+                dataset_name=ds.aime_dataset, split=ds.aime_split,
+            )
+        if "ceval" in wanted:
+            out["ceval"] = eval_ceval(
+                runtime, subjects=ds.ceval_subjects,
+                num_q_per_subject=ds.ceval_num_q_per_subject,
+                seed=config.seed, dataset_name=ds.ceval_dataset,
+            )
+        if "humaneval" in wanted:
+            out["humaneval"] = eval_humaneval(
+                runtime, num_samples=ds.humaneval_num_samples,
+                max_new_tokens=ds.humaneval_max_new_tokens, seed=config.seed,
+                execute=ds.humaneval_execute, timeout=ds.humaneval_timeout,
+                dataset_name=ds.humaneval_dataset,
+            )
+
     for m in ("logit_kl", "token_agree"):
         if m in wanted:
             out[m] = {"skipped": "requires baseline wiring (not yet implemented)"}
@@ -104,7 +195,23 @@ def _run_quality_llm(runtime, runtime_name: str, config: BenchmarkConfig) -> dic
 
 def _run_quality_ocr(runtime, runtime_name: str, entry: BenchmarkModelEntry,
                      config: BenchmarkConfig) -> dict:
-    """Run OCR metrics for VLM models on a generate_vlm-capable runtime."""
+    """Evaluate OCR performance on vision-language models.
+
+    Only executes if the model is a VLM and the runtime supports generate_vlm().
+    Evaluates one or more OCR datasets (specified in config.datasets.ocr_dataset
+    or .ocr_datasets) and returns results keyed by dataset name if multiple.
+
+    Args:
+        runtime: Initialized VLM runtime.
+        runtime_name: Runtime identifier for conditional gating (HF only).
+        entry: BenchmarkModelEntry with is_vlm flag and model metadata.
+        config: BenchmarkConfig with OCR dataset and metric parameters.
+
+    Returns:
+        Single dataset → flat dict with keys (cer, wer, exact_match, bleu, num_samples).
+        Multiple datasets → dict[dataset_name] of same structure.
+        Returns skip marker dict if model is not VLM or runtime unsupported.
+    """
     if not entry.is_vlm:
         return {"skipped": "model_type != 'vlm'"}
     if runtime_name != "hf":
@@ -112,42 +219,65 @@ def _run_quality_ocr(runtime, runtime_name: str, entry: BenchmarkModelEntry,
 
     from src.evaluation.eval_ocr import eval_ocr
 
-    results = eval_ocr(
-        runtime,
-        dataset_name=config.datasets.ocr_dataset,
-        num_samples=config.datasets.ocr_num_samples,
-        max_new_tokens=config.datasets.ocr_max_new_tokens,
-        seed=config.seed,
-    )
-    # Drop heavy per-sample list from the saved summary (kept metrics only).
-    results.pop("per_sample", None)
-    return results
+    ds = config.datasets
+    names = ds.ocr_datasets or [ds.ocr_dataset]
+
+    def _one(name: str) -> dict:
+        r = eval_ocr(
+            runtime,
+            dataset_name=name,
+            num_samples=ds.ocr_num_samples,
+            max_new_tokens=ds.ocr_max_new_tokens,
+            split=ds.ocr_split,
+            seed=config.seed,
+            image_field=ds.ocr_image_field,
+            text_field=ds.ocr_text_field,
+            subset=ds.ocr_subset,
+        )
+        r.pop("per_sample", None)   # keep aggregate metrics only
+        return r
+
+    # Single dataset → flat dict (keeps comparison-summary cer extraction working).
+    if len(names) == 1:
+        return _one(names[0])
+    # Multiple datasets → keyed by dataset name.
+    return {name: _one(name) for name in names}
 
 
 def _run_perf(runtime, config: BenchmarkConfig) -> dict:
-    """Run latency (ttft/tpot) and throughput sweeps."""
-    out: dict = {}
-    wanted = config.metrics.perf
-    lat = config.latency
+    """Benchmark performance metrics: latency, throughput, and memory usage.
 
-    if "ttft" in wanted or "tpot" in wanted:
-        out["latency"] = runtime.measure_ttft_tpot(
-            _PERF_PROMPT, n=lat.num_requests,
-        )
+    Delegates to the performance runner (src.evaluation.performance) which
+    orchestrates measurements with OOM isolation: a GPU out-of-memory at any
+    measurement stage is caught and recorded as a marker, not a fatal crash.
 
-    if "throughput" in wanted:
-        out["throughput"] = runtime.measure_throughput(
-            _PERF_PROMPT,
-            batch_sizes=lat.batch_sizes,
-            output_len=lat.output_lens[0],
-        )
+    Args:
+        runtime: Initialized model runtime.
+        config: BenchmarkConfig with performance measurement parameters.
 
-    return out
+    Returns:
+        Dict with keys: latency (ttft_ms_p50, tpot_ms_p50), throughput
+        (list of token rates at varying batch sizes), and context capacity.
+    """
+    from src.evaluation.performance import run_perf_metrics
+    return run_perf_metrics(runtime, config, perf_prompt=_PERF_PROMPT)
 
 
 def _run_memory(runtime, entry: BenchmarkModelEntry,
                 load_time_s: float, config: BenchmarkConfig) -> dict:
-    """Collect disk size, peak VRAM, and load time."""
+    """Collect memory and disk footprint metrics.
+
+    Args:
+        runtime: Initialized model runtime with peak_vram_mb() method.
+        entry: BenchmarkModelEntry pointing to the model checkpoint.
+        load_time_s: Model load duration in seconds.
+        config: BenchmarkConfig with memory.* metric selection flags.
+
+    Returns:
+        Dict with keys: disk_mb (checkpoint size), peak_vram_mb (max GPU memory),
+        load_time_s (model initialization duration). Only present keys correspond
+        to enabled metrics in config.metrics.memory.
+    """
     out: dict = {}
     wanted = config.metrics.memory
 
@@ -166,18 +296,43 @@ def _run_model_on_runtime(
     runtime_name: str,
     config: BenchmarkConfig,
 ) -> dict:
-    """Build the runtime for *entry*, run all enabled metric groups, unload.
+    """Load a model and run all enabled metric suites, with per-group error isolation.
 
-    Each metric group is wrapped so one failure does not abort the others;
-    failed groups map to ``{"error": "<traceback>"}``.
+    Instantiates the runtime, loads the model, runs each metric group
+    (memory, quality_llm, quality_ocr, perf) in a try-except wrapper so one
+    group's failure does not prevent others from running. Model is always
+    unloaded in a finally block. GPU OOM during load is caught and markers
+    are returned for graceful degradation.
+
+    Args:
+        entry: BenchmarkModelEntry with model metadata and path.
+        runtime_name: "hf" or "vllm" runtime identifier.
+        config: BenchmarkConfig controlling all evaluation parameters.
+
+    Returns:
+        Dict with keys: "memory", "quality_llm", "quality_ocr", "perf" containing
+        metric results or error/skip markers. Special markers: "oom_on_load",
+        "error_on_load", "fatal_error" indicate load-stage failures.
+
+    Raises:
+        Does not raise; exceptions are caught and recorded in output dict.
     """
     from src.runtimes import build_runtime
+    from src.evaluation.performance import clear_gpu_memory, is_oom_error
 
     results: dict = {}
 
     logger.info("[%s @ %s] Loading model …", entry.name, runtime_name)
     t0 = time.perf_counter()
-    runtime = build_runtime(runtime_name, entry)   # instantiates + loads
+    try:
+        runtime = build_runtime(runtime_name, entry)   # instantiates + loads
+    except Exception as exc:
+        # Load-time OOM/error must not poison the next model — free VRAM and
+        # return a marker so the outer loop records "failed" and moves on.
+        clear_gpu_memory()
+        marker = "oom_on_load" if is_oom_error(exc) else "error_on_load"
+        logger.error("[%s @ %s] %s: %s", entry.name, runtime_name, marker, exc)
+        return {marker: traceback.format_exc()}
     load_time_s = time.perf_counter() - t0
 
     try:
@@ -201,12 +356,26 @@ def _run_model_on_runtime(
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Summary
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _build_comparison_summary(all_results: dict) -> dict:
-    """Flatten per-(model,runtime) records into side-by-side rows."""
+    """Reshape flat benchmark results into a comparison table.
+
+    Flattens per-(model, runtime) result records, extracting key metrics
+    (latency, throughput, VRAM, PPL, MMLU, CER) into columnar rows for
+    easy comparison across models and runtimes.
+
+    Args:
+        all_results: Dict mapping result keys (e.g., "modelA@hf") to full
+                     result records from _run_model_on_runtime().
+
+    Returns:
+        Dict with keys:
+          - timestamp: ISO datetime of benchmark run start
+          - num_records: count of result rows
+          - records: list of dicts (one per model-runtime pair) with columns
+                     [model, runtime, status, ttft_ms_p50, tpot_ms_p50, best_tps,
+                      peak_vram_mb, disk_mb, ppl, mmlu_acc, ocr_cer]
+    """
     rows = []
     for key, record in all_results.items():
         m = record.get("metrics", {})
@@ -244,7 +413,12 @@ def _build_comparison_summary(all_results: dict) -> dict:
 
 
 def _print_summary_table(summary: dict) -> None:
-    """Pretty-print the comparison table to the log."""
+    """Pretty-print the comparison table to the log.
+
+    Metric columns are adaptive: an optional column (PPL/MMLU/CER/…) is shown
+    only when at least one row carries a value for it. So an OCR-only run drops
+    PPL/MMLU, and an LLM-only run drops CER — no all-N/A columns.
+    """
     rows = summary.get("records", [])
     if not rows:
         return
@@ -252,27 +426,47 @@ def _print_summary_table(summary: dict) -> None:
     def _fmt(v, fmt=".1f"):
         return f"{v:{fmt}}" if isinstance(v, (int, float)) else "N/A"
 
-    header = (f"{'Model':<20}{'RT':<6}{'Status':<9}{'TTFT':<9}{'TPOT':<9}"
-              f"{'TPS':<10}{'VRAM(MB)':<11}{'PPL':<8}{'MMLU':<7}{'CER':<7}")
+    # (key, header, value-fmt, column-width). First three are always shown.
+    core_cols = [
+        ("model",   "Model",  None, 20),
+        ("runtime", "RT",     None, 6),
+        ("status",  "Status", None, 9),
+    ]
+    optional_cols = [
+        ("ttft_ms_p50",  "TTFT",     ".1f", 9),
+        ("tpot_ms_p50",  "TPOT",     ".1f", 9),
+        ("best_tps",     "TPS",      ".1f", 10),
+        ("peak_vram_mb", "VRAM(MB)", ".1f", 11),
+        ("ppl",          "PPL",      ".2f", 8),
+        ("mmlu_acc",     "MMLU",     ".3f", 7),
+        ("ocr_cer",      "CER",      ".3f", 7),
+    ]
+    # Keep only optional columns that have data in at least one row.
+    shown = [c for c in optional_cols
+             if any(isinstance(r.get(c[0]), (int, float)) for r in rows)]
+    cols = core_cols + shown
+
+    header = "".join(f"{h:<{w}}" for _, h, _, w in cols)
     sep = "─" * len(header)
     logger.info(sep)
     logger.info(header)
     logger.info(sep)
     for r in rows:
-        logger.info(
-            f"{str(r['model'])[:19]:<20}{str(r['runtime']):<6}{str(r['status']):<9}"
-            f"{_fmt(r.get('ttft_ms_p50')):<9}{_fmt(r.get('tpot_ms_p50')):<9}"
-            f"{_fmt(r.get('best_tps')):<10}{_fmt(r.get('peak_vram_mb')):<11}"
-            f"{_fmt(r.get('ppl'), '.2f'):<8}{_fmt(r.get('mmlu_acc'), '.3f'):<7}"
-            f"{_fmt(r.get('ocr_cer'), '.3f'):<7}"
-        )
+        line = ""
+        for key, _h, fmt, w in cols:
+            if fmt is None:
+                cell = str(r.get(key))
+                if key == "model":
+                    cell = cell[:w - 1]
+            else:
+                cell = _fmt(r.get(key), fmt)
+            line += f"{cell:<{w}}"
+        logger.info(line)
     logger.info(sep)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 
+# Main
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="TripleQuant-VLM — benchmark multiple models on HF and/or vLLM.",
@@ -325,6 +519,24 @@ def main() -> None:
             logger.warning("Skipping '%s' on arch=%s (skip_on).", entry.name, arch)
             continue
 
+        # Pre-skip local checkpoints that haven't been produced yet — avoids a noisy
+        # from_pretrained traceback per missing model. Hub ids (is_local=False) fall
+        # through and download as usual.
+        if entry.is_local and not Path(entry.path).exists():
+            logger.warning("Skipping '%s': local path not found (%s). "
+                           "Quantize this variant first.", entry.name, entry.path)
+            all_results[f"{entry.name}@_"] = {
+                "model_name": entry.name, "model_path": entry.path,
+                "model_type": entry.model_type, "runtime": "—",
+                "status": "skipped", "timestamp": run_ts,
+                "metrics": {"skipped": "local checkpoint not found"},
+            }
+            continue
+
+        # Descend into the quantize.py save subfolder if the path points at its parent.
+        if entry.is_local:
+            entry.path = _resolve_checkpoint_dir(entry.path)
+
         for runtime_name in config.runtimes:
             tag = f"{entry.name}@{runtime_name}"
             logger.info("=" * 60)
@@ -333,7 +545,12 @@ def main() -> None:
 
             try:
                 metrics = _run_model_on_runtime(entry, runtime_name, config)
-                status = "success"
+                # _run_model_on_runtime returns a marker dict (not an exception)
+                # when the model never loaded — reflect that in the status.
+                if any(k in metrics for k in ("oom_on_load", "error_on_load", "fatal_error")):
+                    status = "failed"
+                else:
+                    status = "success"
             except Exception:
                 tb = traceback.format_exc()
                 logger.error("[%s] Fatal:\n%s", tag, tb)

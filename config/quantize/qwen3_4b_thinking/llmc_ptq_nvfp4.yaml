@@ -1,0 +1,30 @@
+# Qwen3-4B-Thinking · PTQ · NVFP4 (4-bit float, group 16) · llm_compressor
+# NOTE: NVFP4 inference requires Blackwell (sm_100+). Quantization/export works
+# anywhere, but loading for benchmark needs Blackwell or a compatible emulation.
+method: ptq
+backend: llm_compressor
+
+model:
+  model_id: Qwen/Qwen3-4B-Thinking-2507
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  model_type: llm
+  modality: text
+
+scheme:
+  scheme: NVFP4               # group_size/strategy fixed by preset (tensor_group, 16)
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  num_samples: 128
+  max_seq_len: 2048
+  seed: 42
+
+output:
+  output_dir: ./outputs/qwen3-4b-thinking/ptq-nvfp4
+  save_compressed: true
+  save_processor: true

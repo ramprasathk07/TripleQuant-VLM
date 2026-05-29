@@ -1,0 +1,43 @@
+﻿# tencent/HunyuanOCR (1B OCR VLM) Â· GPTQ Â· INT4 (W4A16) Â· llm_compressor
+# See awq_w4a16.yaml for the trust_remote_code / transformers / use_fast caveats.
+method: gptq
+backend: llm_compressor
+
+model:
+  model_id: tencent/HunyuanOCR
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: true
+  model_type: vlm
+  modality: vision_text
+
+scheme:
+  scheme: W4A16
+  group_size: 128
+  symmetric: true
+  actorder: true
+  per_channel: false
+  observer: mse
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: linxy/LaTeX_OCR
+  subset: full              # required: LaTeX_OCR is multi-config; 'full' has train/val/test
+  dataset_format: image_text
+  split: train
+  image_field: image
+  text_field: text             # real column is 'text', not 'formula'
+  instruction_prompt: "Read the text in the image."
+  num_samples: 64
+  max_seq_len: 2048
+  seed: 42
+
+output:
+  output_dir: ./outputs/hunyuan-ocr/gptq-w4a16
+  save_compressed: true
+  save_processor: true
+
+gptq:
+  dampening_frac: 0.01
+  block_size: 128

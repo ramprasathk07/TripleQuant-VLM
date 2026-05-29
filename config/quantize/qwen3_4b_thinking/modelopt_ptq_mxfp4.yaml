@@ -1,0 +1,30 @@
+# Qwen3-4B-Thinking · ModelOpt · MXFP4 (MXFP4_DEFAULT_CFG) · nvidia-modelopt
+# MXFP4 is a modelopt-only format (not available via llm_compressor).
+method: ptq
+backend: modelopt
+
+model:
+  model_id: Qwen/Qwen3-4B-Thinking-2507
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  model_type: llm
+  modality: text
+
+scheme:
+  scheme: MXFP4
+  group_size: 32             # MXFP4 micro-block size
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  num_samples: 128
+  max_seq_len: 2048
+  seed: 42
+
+output:
+  output_dir: ./outputs/qwen3-4b-thinking/modelopt-mxfp4
+  save_compressed: true
+  save_processor: true

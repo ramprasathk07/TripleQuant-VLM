@@ -58,12 +58,28 @@ def _sync_cuda() -> None:
 
 
 def _percentile(sorted_data: list[float], p: float) -> float:
+    """Return the p-th percentile from a sorted list of values.
+
+    Args:
+        sorted_data: Pre-sorted list of floats.
+        p: Percentile rank (0.0-1.0).
+
+    Returns:
+        Value at the requested percentile.
+    """
     idx = max(0, min(int(len(sorted_data) * p), len(sorted_data) - 1))
     return sorted_data[idx]
 
 
 def _timing_stats(times_ms: list[float]) -> dict:
-    """Returns mean / p50 / p95 / p99 / min / max for a list of timings."""
+    """Compute timing statistics (mean, percentiles, min/max).
+
+    Args:
+        times_ms: List of timing measurements in milliseconds.
+
+    Returns:
+        Dict with keys: mean, p50, p95, p99, min, max.
+    """
     s = sorted(times_ms)
     return {
         "mean": statistics.mean(s),
@@ -76,10 +92,17 @@ def _timing_stats(times_ms: list[float]) -> dict:
 
 
 def _resolve_vllm_dtype(dtype_str: Optional[str]) -> str:
-    """
-    Maps a dtype string to a vLLM-accepted dtype string.
+    """Map dtype string to vLLM-compatible dtype string.
 
-    vLLM accepts: "auto", "float16", "bfloat16", "float32"
+    Args:
+        dtype_str: Dtype name (aliases: 'fp16'/'float16', 'bf16'/'bfloat16',
+                   'fp32'/'float32', 'auto' or None).
+
+    Returns:
+        vLLM-compatible dtype string ('float16', 'bfloat16', 'float32', 'auto').
+
+    Raises:
+        ValueError: If dtype_str is not recognized.
     """
     _map = {
         "fp16":     "float16",
@@ -101,12 +124,20 @@ def _resolve_vllm_dtype(dtype_str: Optional[str]) -> str:
 
 
 def _resolve_vllm_quantization(quant: Optional[str]) -> Optional[str]:
-    """
-    Maps quantization strings to vLLM-accepted values.
+    """Map quantization string to vLLM-accepted quantization type.
 
-    vLLM supports: None, "awq", "gptq", "squeezellm", "fp8",
-    "compressed-tensors" (llm-compressor output), "modelopt", "modelopt_fp4".
-    BnB (int4/int8) is NOT supported by vLLM — raises a clear error.
+    Args:
+        quant: Quantization method name (e.g., 'awq', 'gptq', 'fp8', 'compressed-tensors').
+
+    Returns:
+        vLLM quantization string, or None for no quantization.
+
+    Raises:
+        ValueError: If quantization method is not supported by vLLM (e.g., BitsAndBytes).
+
+    Note:
+        vLLM does NOT support BitsAndBytes (int4, int8, nf4). Use pre-quantized
+        model variants (AWQ, GPTQ, llm-compressor, ModelOpt) instead.
     """
     if quant is None or quant.lower() in ("none", ""):
         return None
@@ -136,52 +167,52 @@ def _resolve_vllm_quantization(quant: Optional[str]) -> Optional[str]:
 # ════════════════════════════════════════════════════════════════════════════════
 
 class VLLMRuntime(RuntimeBase):
-    """
-    vLLM-based runtime for high-throughput LLM inference.
+    """vLLM backend for high-throughput text-only LLM inference.
+
+    Wraps vLLM's LLM engine for fast batch/streaming generation. Supports
+    native AWQ/GPTQ quantization, tensor parallelism, and GPU memory tuning.
+    Text-only: VLM, logit-returning, and quantization-free inference methods
+    raise NotImplementedError.
+
+    Attributes:
+        name: Identifier 'vllm' for runtime registry.
+
+    Limitations:
+        - forward_logits() raises NotImplementedError (vLLM hides logits).
+        - generate_with_logits() raises NotImplementedError.
+        - generate_vlm() raises NotImplementedError (text-only).
+        - No BitsAndBytes support; use pre-quantized models (AWQ, GPTQ).
 
     Usage:
         runtime = VLLMRuntime()
         runtime.load(entry)
         outputs = runtime.generate(["Hello!"], max_new_tokens=64)
         runtime.unload()
-
-    Notes:
-        - forward_logits() and generate_with_logits() are NOT supported.
-        - generate_vlm() is NOT supported (text-only).
-        - Quantization: use AWQ / GPTQ model variants, not BnB.
     """
 
     name = "vllm"
 
-    # ── Construction ──────────────────────────────────────────────────────────
-
     def __init__(self) -> None:
+        """Initialize VLLMRuntime, checking vllm availability."""
         _require_vllm()
 
         self._llm:      Optional["LLM"] = None
         self._model_id: str             = ""
-        self._tokenizer                 = None   # vLLM exposes get_tokenizer()
-
-    # ════════════════════════════════════════════════════════════════════════════
-    # Lifecycle
-    # ════════════════════════════════════════════════════════════════════════════
+        self._tokenizer                 = None
 
     def load(self, entry: "BenchmarkModelEntry") -> None:
-        """
-        Initialises the vLLM LLM engine from a BenchmarkModelEntry.
+        """Initialize vLLM engine from BenchmarkModelEntry config.
 
-        Reads from entry:
-            entry.path                    str   – HF hub id or local dir
-            entry.vllm_quantization       Optional[str] – None / 'awq' / 'gptq' / 'fp8' / 'compressed-tensors'
-            entry.dtype                   str   – 'auto' / 'float16' / 'bfloat16'
-            entry.tensor_parallel_size    int   – number of GPUs (default 1)
-            entry.gpu_memory_utilization  float – fraction of GPU mem (default 0.85)
-            entry.max_model_len           int   – max sequence length
-            entry.trust_remote_code       bool
+        Creates and configures the vLLM LLM engine with model, quantization,
+        dtype, and tensor parallelism settings.
+
+        Args:
+            entry: BenchmarkModelEntry specifying model path, quantization,
+                   dtype, tensor_parallel_size, gpu_memory_utilization, max_model_len.
 
         Raises:
-            RuntimeError: if engine is already loaded.
-            ValueError:   if BnB quantization is requested.
+            RuntimeError: If engine is already loaded.
+            ValueError: If BitsAndBytes quantization is requested (not supported by vLLM).
         """
         if self._llm is not None:
             raise RuntimeError(
@@ -552,6 +583,47 @@ class VLLMRuntime(RuntimeBase):
         if not torch.cuda.is_available():
             return 0.0
         return torch.cuda.memory_allocated() / (1024 ** 2)
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # Max context  (read from engine config — vLLM pre-sizes the KV cache, no probe)
+    # ════════════════════════════════════════════════════════════════════════════
+
+    def measure_max_context(self) -> dict:
+        """Report the engine's max context + KV-cache capacity.
+
+        Unlike the HF probe (which binary-searches for the OOM boundary), vLLM
+        fixes ``max_model_len`` at load and pre-allocates the KV cache, so the
+        usable context is known exactly from the engine config. Returns the same
+        ``model_max_positions``/``measured_max_tokens`` keys as HFRuntime plus
+        vLLM-specific KV stats when available.
+        """
+        self._check_loaded()
+        out: dict = {
+            "model_max_positions": None,
+            "measured_max_tokens": None,
+            "oom_at_tokens":       None,
+            "capped_by":           "vllm_max_model_len",
+        }
+        try:
+            mcfg = self._llm.llm_engine.model_config
+            max_len = int(mcfg.max_model_len)
+            out["model_max_positions"] = max_len
+            out["measured_max_tokens"] = max_len   # guaranteed loadable by construction
+        except Exception as e:
+            logger.warning("[VLLMRuntime] could not read max_model_len: %s", e)
+
+        # KV-cache block stats (attribute path varies across vLLM versions).
+        try:
+            cache_cfg = self._llm.llm_engine.cache_config
+            num_blocks = getattr(cache_cfg, "num_gpu_blocks", None)
+            block_size = getattr(cache_cfg, "block_size", None)
+            if num_blocks and block_size:
+                out["kv_cache_tokens"] = int(num_blocks) * int(block_size)
+                out["kv_gpu_blocks"]   = int(num_blocks)
+                out["kv_block_size"]   = int(block_size)
+        except Exception:
+            pass
+        return out
 
     # ════════════════════════════════════════════════════════════════════════════
     # Tokenizer access (convenience)

@@ -18,6 +18,7 @@ class QuantScheme(str, Enum):
     """All supported quantization bit-schemes and data types."""
     W4A16 = "W4A16"
     W4A16_ASYM = "W4A16_ASYM"
+    W4A8 = "W4A8"
     W8A8 = "W8A8"
     W8A8_ASYM = "W8A8_ASYM"
     W8A16 = "W8A16"
@@ -25,18 +26,19 @@ class QuantScheme(str, Enum):
     FP8_DYNAMIC = "FP8_DYNAMIC"
     FP8_BLOCK = "FP8_BLOCK"
     NVFP4 = "NVFP4"
+    NVFP4A16 = "NVFP4A16"
     MXFP4 = "MXFP4"
 
 
 QuantSchemeLiteral = Literal[
-    "W4A16", "W4A16_ASYM",
+    "W4A16", "W4A16_ASYM", "W4A8",
     "W8A8", "W8A8_ASYM", "W8A16",
     "FP8", "FP8_DYNAMIC", "FP8_BLOCK",
-    "NVFP4", "MXFP4",
+    "NVFP4", "NVFP4A16", "MXFP4",
 ]
 
-MethodLiteral = Literal["awq", "gptq", "turboquant"]
-ModalityLiteral = Literal["auto", "text", "vision", "audio"]
+MethodLiteral = Literal["awq", "gptq", "ptq", "turboquant"]
+ModalityLiteral = Literal["auto", "text", "vision", "vision_text", "audio"]
 ModelTypeLiteral = Literal["llm", "vlm", "moe", "custom"]
 
 # New type for observers
@@ -44,7 +46,21 @@ ObserverLiteral = Literal["mse", "minmax", "maxabs", "percentile"]
 
 # Sub-configs
 class ModelConfig(BaseModel):
-    """Hugging Face model loading configuration including dtype, device placement, and vision/text modality hints."""
+    """Hugging Face model loading configuration.
+
+    Controls model instantiation, dtype, device placement, and modality hints.
+    Used during quantization (config.model) and benchmarking (BenchmarkModelEntry).
+
+    Attributes:
+        model_id: Hugging Face model identifier (e.g., 'meta-llama/Llama-2-7b').
+        torch_dtype: PyTorch dtype string (e.g., 'bfloat16', 'float16').
+        device_map: Device placement strategy for multi-GPU ('auto', 'cuda', etc.).
+        trust_remote_code: Allow loading custom code from model's repo (required for some VLMs).
+        model_type: Classification hint for routing ('llm', 'vlm', 'moe', 'custom').
+        modality: Modality hint ('auto', 'text', 'vision', 'vision_text', 'audio').
+        min_pixels: Minimum image pixels for VLM processors (dynamic resolution).
+        max_pixels: Maximum image pixels for VLM processors (dynamic resolution).
+    """
     model_id: str
     torch_dtype: str = "bfloat16"
     device_map: str = "auto"
@@ -60,7 +76,21 @@ class SchemeConfig(BaseModel):
 
     Controls precision (W4A16, W8A8, FP8, etc.), group size for grouped quantization,
     symmetry, activation order heuristic, and observer/calibration strategy.
+
+    Attributes:
+        scheme: Quantization bit-width scheme (e.g., 'W4A16', 'W8A8', 'FP8_DYNAMIC').
+        group_size: Granularity for grouped quantization. Must be power of 2 (e.g., 128).
+        symmetric: If True, use symmetric quantization; else asymmetric (with zero-point).
+        actorder: If True, use activation-order heuristic (AWQ/GPTQ optimization).
+        block_size: Block dimensions for FP8_BLOCK scheme, [M, N] where both > 0. None for other schemes.
+        targets: Layer module types to quantize (e.g., ['Linear']; empty = all).
+        ignore: Layer name patterns to exclude from quantization (regex or literal).
+        observer: Calibration statistics observer: 'mse', 'minmax', 'maxabs', 'percentile'.
+        per_channel: If True, compute separate quantization ranges per output channel.
+        dynamic_activations: If True, quantize activations dynamically per sample.
     """
+    model_config = ConfigDict(extra="forbid")
+
     scheme: QuantSchemeLiteral = "W4A16"
     group_size: int = 128
     symmetric: bool = True
@@ -98,19 +128,34 @@ class CalibrationConfig(BaseModel):
 
     Specifies the dataset source, number of samples, sequence length, field names
     (for text and image columns), and format detection strategy (auto, chat, or image_text).
+
+    Attributes:
+        dataset_name: Hugging Face dataset identifier (e.g., 'HuggingFaceH4/ultrachat_200k').
+        subset: HF dataset config name for multi-config datasets (e.g., 'full' for linxy/LaTeX_OCR).
+                Required when dataset has multiple configs; None for single-config datasets.
+        num_samples: Number of calibration samples to use (for computing quantization statistics).
+        max_seq_len: Maximum sequence length for tokenized inputs (pads/truncates to this).
+        split: Dataset split to load ('train', 'validation', 'test').
+        image_field: Column name for image data in VLM datasets (None = auto-detect).
+        text_field: Column name for text data (None = auto-detect).
+        seed: Random seed for reproducible sample selection.
+        dataset_format: Auto-detect or hint: 'auto', 'chat', 'image_text'.
+        instruction_prompt: Custom instruction prompt for dataset-specific formatting.
+                           None = auto-select based on dataset name.
     """
     model_config = ConfigDict(extra="forbid")
 
     dataset_name: str = "HuggingFaceH4/ultrachat_200k"
+    subset: Optional[str] = None
     num_samples: int = 512
     max_seq_len: int = 2048
     split: str = "train"
     image_field: Optional[str] = "image"
     text_field: Optional[str] = "text"
     seed: int = 42
-    dataset_format:     str          = "auto"   # "auto" | "chat" | "image_text"
-    instruction_prompt: Optional[str] = None    # None = auto-select based on dataset
-    
+    dataset_format:     str          = "auto"
+    instruction_prompt: Optional[str] = None
+
     @field_validator("num_samples", "max_seq_len")
     @classmethod
     def _positive(cls, v: int) -> int:
@@ -124,6 +169,12 @@ class OutputConfig(BaseModel):
 
     Specifies output directory, whether to save in compressed format, processor/tokenizer
     preservation, and optional Hugging Face Hub integration.
+
+    Attributes:
+        output_dir: Directory where quantized model is saved (expands ~ to home).
+        save_compressed: If True, use safetensors compressed format; else standard safetensors.
+        save_processor: If True, save VLM processor or LLM tokenizer alongside model.
+        push_to_hub: Optional Hugging Face Hub repo ID to push quantized model to.
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -141,9 +192,17 @@ class OutputConfig(BaseModel):
 class SmoothQuantConfig(BaseModel):
     """SmoothQuant activation quantization configuration.
 
-    Enables layer-wise smooth quantization with per-layer strength and module
+    Enables layer-wise activation quantization with per-layer strength and module
     mappings that define which quantization layers follow which linear layers.
+
+    Attributes:
+        enabled: Whether SmoothQuant is applied (default True when this config present).
+        strength: Per-layer smooth strength factor (0.0-1.0; higher = more aggressive).
+        mappings: List of [quantization_layers, associated_linear_layer] pairs,
+                  where each layer can be a regex pattern ('re:...') or literal name.
     """
+    model_config = ConfigDict(extra="forbid")
+
     enabled: bool = True
     strength: float = 0.5
     mappings: List[List[Union[List[str], str]]] = [
@@ -153,18 +212,44 @@ class SmoothQuantConfig(BaseModel):
 
 
 class AWQParams(BaseModel):
-    """AWQ-specific hyperparameters."""
+    """AWQ-specific hyperparameters.
+
+    Attributes:
+        duo_scaling: If True, use duo-scaling variant for improved accuracy.
+    """
+    model_config = ConfigDict(extra="forbid")
+
     duo_scaling: bool = False
 
 
 class GPTQParams(BaseModel):
-    """GPTQ-specific hyperparameters."""
+    """GPTQ-specific hyperparameters.
+
+    Attributes:
+        dampening_frac: Damping factor for Hessian computation (0.01 typical).
+        block_size: Hessian block size for gradient computation (128 typical).
+        sequential_update: If True, update weights sequentially per block.
+    """
+    model_config = ConfigDict(extra="forbid")
+
     dampening_frac: float = 0.01
+    block_size: int = 128
     sequential_update: bool = True
 
 
 # Top-level QuantizeConfig
+# Scheme/method compatibility sets (llm_compressor backend).
 _AWQ_ALLOWED_SCHEMES: set[str] = {"W4A16", "W4A16_ASYM"}
+_GPTQ_ALLOWED_SCHEMES: set[str] = {
+    "W4A16", "W4A16_ASYM", "W4A8", "W8A16", "W8A8", "W8A8_ASYM",
+}
+# Float-typed schemes have no algorithm variant — PTQ only.
+_FLOAT_SCHEMES: set[str] = {
+    "FP8", "FP8_DYNAMIC", "FP8_BLOCK", "NVFP4", "NVFP4A16", "MXFP4",
+}
+# Schemes llm_compressor cannot build — route to backend=modelopt.
+_MODELOPT_ONLY_SCHEMES: set[str] = {"FP8_BLOCK", "MXFP4"}
+
 BackendLiteral = Literal["llm_compressor", "modelopt"]
 
 
@@ -174,6 +259,17 @@ class QuantizeConfig(BaseModel):
     Orchestrates model loading, calibration data, quantization scheme/backend selection,
     and optional tuning (AWQ duo-scaling, GPTQ dampening, SmoothQuant). Validates
     method-scheme compatibility (e.g., AWQ only supports W4A16 variants).
+
+    Attributes:
+        method: Quantization algorithm ('awq', 'gptq', 'ptq', 'turboquant').
+        backend: Quantization framework ('llm_compressor' or 'modelopt').
+        model: Model loading configuration (model_id, dtype, device_map, etc.).
+        scheme: Quantization scheme configuration (bit-width, group_size, observer, etc.).
+        calibration: Calibration dataset configuration (dataset_name, num_samples, etc.).
+        output: Output export configuration (output_dir, compression, Hub push).
+        smoothquant: Optional SmoothQuant activation quantization config.
+        awq: Optional AWQ-specific hyperparameters.
+        gptq: Optional GPTQ-specific hyperparameters.
     """
     method: MethodLiteral
     backend: BackendLiteral = "llm_compressor"
@@ -187,12 +283,37 @@ class QuantizeConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_method_scheme_compat(self) -> QuantizeConfig:
+        # Only the llm_compressor backend uses these recipe constraints.
+        # modelopt and turboquant have their own scheme handling.
+        if self.backend != "llm_compressor" or self.method == "turboquant":
+            return self
+
         scheme = self.scheme.scheme
+
+        if scheme in _MODELOPT_ONLY_SCHEMES:
+            raise ValueError(
+                f"scheme='{scheme}' is not supported by backend='llm_compressor'. "
+                f"Set backend='modelopt' for {sorted(_MODELOPT_ONLY_SCHEMES)}."
+            )
+
         if self.method == "awq" and scheme not in _AWQ_ALLOWED_SCHEMES:
             raise ValueError(
-                f"method='awq' requires scheme in {_AWQ_ALLOWED_SCHEMES}, "
+                f"method='awq' requires scheme in {sorted(_AWQ_ALLOWED_SCHEMES)}, "
                 f"got '{scheme}'."
             )
+
+        if self.method == "gptq" and scheme not in _GPTQ_ALLOWED_SCHEMES:
+            raise ValueError(
+                f"method='gptq' requires an INT scheme in {sorted(_GPTQ_ALLOWED_SCHEMES)}, "
+                f"got '{scheme}'. Float schemes (FP8/NVFP4) need method='ptq'."
+            )
+
+        if scheme in _FLOAT_SCHEMES and self.method != "ptq":
+            raise ValueError(
+                f"scheme='{scheme}' is float-typed and has no algorithm variant — "
+                f"use method='ptq' (got method='{self.method}')."
+            )
+
         return self
 
     @model_validator(mode="after")
@@ -205,21 +326,96 @@ class QuantizeConfig(BaseModel):
 
 
 class MetricsConfig(BaseModel):
-    quality_llm: list[Literal["ppl", "mmlu_tiny", "logit_kl", "token_agree"]] = ["ppl"]
+    """Benchmark metrics selection for evaluation runs.
+
+    Attributes:
+        quality_llm: Text quality metrics ('ppl'=perplexity, 'mmlu_tiny', 'gsm8k', 'aime',
+                    'ceval', 'humaneval', 'logit_kl', 'token_agree').
+        quality_ocr: VLM OCR metrics ('cer'=character error rate, 'wer', 'exact_match', 'bleu').
+        perf: Performance metrics ('ttft'=time-to-first-token, 'tpot'=time-per-output-token,
+              'throughput', 'max_context', 'ctx_sweep').
+        memory: Memory metrics ('disk'=model size, 'vram'=peak GPU, 'load_time').
+    """
+    quality_llm: list[Literal[
+        "ppl", "mmlu_tiny", "logit_kl", "token_agree",
+        "gsm8k", "ceval", "humaneval", "aime",
+    ]] = ["ppl"]
     quality_ocr: list[Literal["cer", "wer", "exact_match", "bleu"]] = ["cer"]
-    perf:        list[Literal["ttft", "tpot", "throughput", "ctx_sweep"]] = ["throughput", "ttft", "tpot"]
+    perf:        list[Literal["ttft", "tpot", "throughput", "ctx_sweep", "max_context"]] = ["throughput", "ttft", "tpot"]
     memory:      list[Literal["disk", "vram", "load_time"]] = ["disk", "vram"]
 
 class EvalDatasetConfig(BaseModel):
+    """Benchmark dataset and metric configuration for quality evaluations.
+
+    Groups dataset names, splits, sample counts, and hyperparameters for each metric
+    (perplexity, MMLU, GSM8K, AIME, C-Eval, HumanEval, OCR). Centralizes all evaluation
+    data sources in one place for reproducibility.
+
+    Attributes:
+        ppl_dataset, ppl_subset: Perplexity evaluation dataset.
+        mmlu_subjects: MMLU subjects to evaluate (subset of cais/mmlu).
+        gsm8k_dataset, gsm8k_num_samples, gsm8k_max_new_tokens: Grade-school math config.
+        aime_dataset, aime_split, aime_num_samples, aime_max_new_tokens: Competition math config.
+        ceval_dataset, ceval_subjects, ceval_num_q_per_subject: Chinese MMLU config.
+        humaneval_dataset, humaneval_num_samples, humaneval_max_new_tokens: Code gen config.
+        humaneval_execute: If True, execute model-generated code (SECURITY: only in sandbox).
+        humaneval_timeout: Timeout in seconds for code execution.
+        ocr_dataset, ocr_datasets, ocr_subset, ocr_image_field, ocr_text_field: OCR config.
+        ocr_split, ocr_num_samples, ocr_max_new_tokens: OCR evaluation parameters.
+    """
+    # ── Perplexity ──
     ppl_dataset: str = "wikitext"
     ppl_subset: str = "wikitext-2-raw-v1"
-    mmlu_subjects: list[str] = ["high_school_mathematics", "computer_science",
-                                "philosophy", "world_history", "global_facts"]
+
+    # ── MMLU (valid cais/mmlu subject configs only) ──
+    mmlu_subjects: list[str] = ["high_school_mathematics", "high_school_computer_science",
+                                "philosophy", "high_school_world_history", "global_facts"]
+
+    # ── GSM8K (grade-school math, generative) ──
+    gsm8k_dataset: str = "openai/gsm8k"
+    gsm8k_num_samples: int = 200
+    gsm8k_max_new_tokens: int = 512
+
+    # ── AIME (competition math, generative) ──
+    aime_dataset: str = "Maxwell-Jia/AIME_2024"
+    aime_split: str = "train"
+    aime_num_samples: int = 30
+    aime_max_new_tokens: int = 1024
+
+    # ── C-Eval (Chinese MC, logit-scored) ──
+    ceval_dataset: str = "ceval/ceval-exam"
+    ceval_subjects: list[str] = ["computer_network", "high_school_mathematics",
+                                 "logic", "college_programming", "marxism"]
+    ceval_num_q_per_subject: int = 20
+
+    # ── HumanEval (code, pass@1) ──
+    humaneval_dataset: str = "openai/openai_humaneval"
+    humaneval_num_samples: int = 20
+    humaneval_max_new_tokens: int = 512
+    humaneval_execute: bool = False          # SECURITY: runs model-generated code if True
+    humaneval_timeout: float = 10.0
+
+    # ── OCR (VLM) ──
     ocr_dataset: str = "linxy/LaTeX_OCR"
+    ocr_datasets: Optional[list[str]] = None  # if set, eval each; else just ocr_dataset
+    ocr_subset: Optional[str] = None          # HF config name; None → registry default (e.g. linxy→"full")
+    ocr_image_field: Optional[str] = None     # None → auto-detect
+    ocr_text_field: Optional[str] = None      # None → auto-detect
+    ocr_split: str = "test"
     ocr_num_samples: int = 500
     ocr_max_new_tokens: int = 256
 
 class LatencyConfig(BaseModel):
+    """Performance profiling parameters for latency and throughput benchmarks.
+
+    Attributes:
+        prompt_lens: Input prompt lengths to test (used for context-sweep benchmarks).
+        output_lens: Output token counts to generate (first value used for throughput).
+        batch_sizes: Batch sizes to sweep for throughput measurement.
+        ctx_sweep: Context lengths to binary-search for max-context capacity.
+        num_requests: Number of timed requests per latency benchmark trial.
+        warmup_requests: Warm-up iterations before timing (excluded from statistics).
+    """
     prompt_lens: list[int] = [512]
     output_lens: list[int] = [128]
     batch_sizes: list[int] = [1, 4, 8, 16]
@@ -228,6 +424,25 @@ class LatencyConfig(BaseModel):
     warmup_requests: int = 5
 
 class BenchmarkModelEntry(BaseModel):
+    """Single model entry in a benchmark comparison run.
+
+    Attributes:
+        name: Display name for the model (e.g., 'TinyLlama 1.1B').
+        path: Local directory or Hugging Face model ID.
+        is_local: If True, load from local disk; else from Hugging Face Hub.
+        is_compressed: If True, use safetensors compressed format.
+        model_type: Model classification ('llm', 'vlm', 'moe', 'custom').
+        backend_hint: Optional quantization backend hint for runtime (overrides auto-detect).
+        vllm_quantization: vLLM quantization format ('compressed-tensors', 'modelopt', etc.).
+        gpu_memory_utilization: vLLM GPU utilization target (0.0-1.0, typical 0.85).
+        max_model_len: Maximum sequence length for generation (vLLM KV-cache limit).
+        skip_on: Skip this model on GPU arch list (e.g., ['sm_86'] for RTX 3060).
+        dtype: Inference dtype ('auto', 'bfloat16', 'float16', 'float32').
+        device_map: Device placement strategy ('auto', 'cuda', etc.).
+        trust_remote_code: Allow loading custom code from model's repo.
+        tensor_parallel_size: vLLM tensor parallelism degree (> 1 for multi-GPU).
+        hf_quantization: Hugging Face on-the-fly BitsAndBytes quantization ('int8', 'int4', 'nf4').
+    """
     name: str
     path: str                     # local dir or HF id
     is_local: bool = False
@@ -252,14 +467,25 @@ class BenchmarkModelEntry(BaseModel):
         return self.model_type == "vlm"
 
 class TrackingConfig(BaseModel):
-    """Multi-backend experiment tracking. Local PNG always written; trackers are additive."""
+    """Multi-backend experiment tracking configuration.
+
+    Enables logging to Weights & Biases, LangFuse, and/or MLflow. Local PNG plots
+    are always generated; experiment trackers are additive (can enable multiple).
+
+    Attributes:
+        enabled: List of tracking backends to use (union of 'wandb', 'langfuse', 'mlflow').
+        wandb_project: Weights & Biases project name.
+        wandb_entity: W&B entity/team name (None = personal account).
+        wandb_tags: List of tags for W&B experiment filtering.
+        wandb_public: If True, create a public shareable W&B project link.
+        wandb_api_key_env: Environment variable name for W&B API key.
+    """
     enabled: list[Literal["wandb", "langfuse", "mlflow"]] = ["wandb", "mlflow"]
 
-    # W&B
     wandb_project: str = "triplequant-vlm"
     wandb_entity: Optional[str] = None
     wandb_tags: list[str] = []
-    wandb_public: bool = True              # use public W&B project (shareable URL)
+    wandb_public: bool = True
     wandb_api_key_env: str = "WANDB_API_KEY"
 
     # Langfuse — for OCR per-sample LLM traces (prompt, image, pred, CER score)

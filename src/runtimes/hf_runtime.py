@@ -31,10 +31,10 @@ logger = logging.getLogger(__name__)
 try:
     from transformers import (
         AutoModelForCausalLM,
+        AutoModelForImageTextToText,
         AutoProcessor,
         AutoTokenizer,
         BitsAndBytesConfig,
-        LlavaForConditionalGeneration,
         GenerationConfig,
     )
     TRANSFORMERS_AVAILABLE = True
@@ -71,13 +71,16 @@ def _require_pil() -> None:
 
 
 def _build_bnb_config(quantization: Optional[str]) -> Optional["BitsAndBytesConfig"]:
-    """
-    Builds a BitsAndBytesConfig from a quantization string.
+    """Build a BitsAndBytesConfig for on-the-fly quantization.
 
-    Supported values:
-        None / "none" / ""  → no quantization
-        "int8"              → load_in_8bit
-        "int4" / "nf4"      → load_in_4bit with nf4 + double quant
+    Args:
+        quantization: Quantization method (None/'none'/'', 'int8', 'int4', 'nf4').
+
+    Returns:
+        BitsAndBytesConfig for load_in_8bit or load_in_4bit, or None for no quantization.
+
+    Raises:
+        ValueError: If quantization string is not recognized.
     """
     if not quantization or quantization.lower() in ("none", ""):
         return None
@@ -103,14 +106,17 @@ def _build_bnb_config(quantization: Optional[str]) -> Optional["BitsAndBytesConf
 
 
 def _resolve_dtype(dtype_str: Optional[str]) -> torch.dtype:
-    """
-    Maps a dtype string to a torch.dtype.
+    """Map dtype string to torch.dtype constant.
 
-    Supported:
-        "float32" / "fp32"   → torch.float32
-        "float16" / "fp16"   → torch.float16
-        "bfloat16" / "bf16"  → torch.bfloat16
-        None / "auto"        → torch.bfloat16  (sensible default)
+    Args:
+        dtype_str: Dtype name or None/'auto' for default (bfloat16).
+                  Supported: 'float32'/'fp32', 'float16'/'fp16', 'bfloat16'/'bf16'.
+
+    Returns:
+        torch.dtype constant.
+
+    Raises:
+        ValueError: If dtype_str is not recognized.
     """
     _map = {
         "float32":  torch.float32,
@@ -132,20 +138,35 @@ def _resolve_dtype(dtype_str: Optional[str]) -> torch.dtype:
 
 
 def _sync_cuda() -> None:
-    """Synchronizes CUDA if available (for accurate timing)."""
+    """Synchronize CUDA device for accurate timing measurements."""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
 def _percentile(sorted_data: list[float], p: float) -> float:
-    """Returns the p-th percentile from a pre-sorted list."""
+    """Return the p-th percentile from a pre-sorted list.
+
+    Args:
+        sorted_data: List sorted in ascending order.
+        p: Percentile rank (0.0-1.0, e.g., 0.95 for 95th percentile).
+
+    Returns:
+        Value at or near the requested percentile.
+    """
     idx = int(len(sorted_data) * p)
     idx = max(0, min(idx, len(sorted_data) - 1))
     return sorted_data[idx]
 
 
 def _timing_stats(times_ms: list[float]) -> dict:
-    """Returns mean / p50 / p95 / p99 / min / max for a list of timings."""
+    """Compute timing statistics (mean, percentiles, min/max).
+
+    Args:
+        times_ms: List of timing measurements in milliseconds.
+
+    Returns:
+        Dict with keys: mean, p50, p95, p99, min, max.
+    """
     s = sorted(times_ms)
     return {
         "mean": statistics.mean(s),
@@ -155,6 +176,84 @@ def _timing_stats(times_ms: list[float]) -> dict:
         "min":  s[0],
         "max":  s[-1],
     }
+import json
+from pathlib import Path
+
+def _detect_compressed(model_path: str) -> bool:
+    """Detect if a checkpoint was saved with save_compressed=True.
+
+    Checks the quantization_config.format field in config.json for 'pack-quantized'.
+
+    Args:
+        model_path: Path to model checkpoint directory.
+
+    Returns:
+        True if compressed format detected; False otherwise.
+    """
+    cfg = Path(model_path) / "config.json"
+    if not cfg.exists():
+        return False
+    try:
+        data = json.loads(cfg.read_text())
+        fmt = data.get("quantization_config", {}).get("format", "")
+        return fmt == "pack-quantized"
+    except Exception:
+        return False
+
+
+def _model_load_kwargs(quant_cfg, dtype, device_map, trust_rc: bool) -> dict:
+    """Build from_pretrained kwargs, omitting quantization_config when None.
+
+    Passing ``quantization_config=None`` explicitly OVERRIDES a pre-quantized
+    checkpoint's own config with None, which then crashes transformers'
+    quantizer detection (`supports_quant_method(None)` -> AttributeError). Only
+    include the key for genuine on-the-fly BitsAndBytes quantization.
+    """
+    kw = dict(torch_dtype=dtype, device_map=device_map, trust_remote_code=trust_rc)
+    if quant_cfg is not None:
+        kw["quantization_config"] = quant_cfg
+    return kw
+
+
+_QC_REPR_PATCHED = False
+
+
+def _patch_quantization_config_repr() -> None:
+    """Work around a transformers bug that crashes loading compressed-tensors VLMs.
+
+    When `from_pretrained` loads a quantized composite VLM (e.g. Qwen2.5-VL), it
+    sets `quantization_config = None` on the *sub*-config (text_config) and then
+    logs `logger.info(f"Model config {config}")`. The repr calls both
+    `to_dict()` and `to_diff_dict()`, each doing `self.quantization_config.to_dict()`
+    without a None-guard -> `AttributeError: 'NoneType' object has no attribute
+    'to_dict'`. Only triggers when transformers logging is at INFO (the benchmark
+    sets root logging to INFO).
+
+    Wrap both methods to temporarily drop a None `quantization_config` so the buggy
+    branch is skipped, then restore it. Idempotent; no-op if transformers missing.
+    """
+    global _QC_REPR_PATCHED
+    if _QC_REPR_PATCHED or not TRANSFORMERS_AVAILABLE:
+        return
+    import transformers.configuration_utils as _cu
+
+    def _guard(orig):
+        def _wrapped(self):
+            if getattr(self, "quantization_config", "x") is None and \
+                    "quantization_config" in self.__dict__:
+                saved = self.__dict__.pop("quantization_config")
+                try:
+                    return orig(self)
+                finally:
+                    self.__dict__["quantization_config"] = saved
+            return orig(self)
+        return _wrapped
+
+    # Both repr paths (to_dict / to_diff_dict) call quantization_config.to_dict().
+    for _name in ("to_dict", "to_diff_dict"):
+        if hasattr(_cu.PretrainedConfig, _name):
+            setattr(_cu.PretrainedConfig, _name, _guard(getattr(_cu.PretrainedConfig, _name)))
+    _QC_REPR_PATCHED = True
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -162,21 +261,30 @@ def _timing_stats(times_ms: list[float]) -> dict:
 # ════════════════════════════════════════════════════════════════════════════════
 
 class HFRuntime(RuntimeBase):
-    """
-    HuggingFace Transformers runtime.
+    """HuggingFace Transformers backend for LLM and VLM inference.
+
+    Supports text-only LLMs and vision-language models (VLMs) with optional
+    on-the-fly BitsAndBytes quantization (int8, int4). Provides logit access
+    for perplexity/KL-divergence evaluation, latency profiling (TTFT/TPOT),
+    and throughput measurements. Explicit unload() frees all GPU memory.
+
+    Attributes:
+        name: Identifier 'hf' for runtime registry.
+        model: Loaded model (AutoModelForCausalLM or VLM equivalent).
+        tokenizer: Loaded tokenizer (AutoTokenizer).
+        processor: Loaded processor (AutoProcessor for VLMs).
 
     Usage:
         runtime = HFRuntime()
-        runtime.load(entry)          # loads model + tokenizer
+        runtime.load(entry)
         outputs = runtime.generate(["Hello!"], max_new_tokens=64)
-        runtime.unload()             # frees all GPU memory
+        runtime.unload()
     """
 
     name = "hf"
 
-    # ── Construction ──────────────────────────────────────────────────────────
-
     def __init__(self) -> None:
+        """Initialize HFRuntime, checking transformers availability."""
         _require_transformers()
 
         self.model:      Optional["AutoModelForCausalLM"] = None
@@ -189,35 +297,28 @@ class HFRuntime(RuntimeBase):
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-    # ════════════════════════════════════════════════════════════════════════════
-    # Lifecycle
-    # ════════════════════════════════════════════════════════════════════════════
-
     def load(self, entry: "BenchmarkModelEntry") -> None:
-        """
-        Loads model + tokenizer / processor from a BenchmarkModelEntry.
+        """Load model and tokenizer/processor from Hugging Face.
 
-        Reads from entry:
-            entry.path                str   – HF hub id or local dir
-            entry.model_type          str   – 'vlm' => load as VLM
-            entry.hf_quantization     Optional[str] – None / 'int8' / 'int4' / 'nf4'
-            entry.dtype               str   – 'auto' / 'bfloat16' / 'float16' / ...
-            entry.device_map          str   – 'auto' / 'cuda:0' / ...
-            entry.trust_remote_code   bool
+        Routes to VLM (AutoProcessor + model) or LLM (AutoTokenizer + model)
+        loading based on entry.model_type. Applies BitsAndBytes quantization
+        if entry.hf_quantization is set; otherwise loads pre-quantized checkpoints
+        (compressed-tensors, ModelOpt) directly.
 
-        Note:
-            Pre-quantized (compressed-tensors / ModelOpt) checkpoints load
-            directly via from_pretrained — leave hf_quantization=None for those.
-            hf_quantization is only for on-the-fly BitsAndBytes quantization.
+        Args:
+            entry: BenchmarkModelEntry specifying model location, dtype, device_map,
+                   quantization, and model type.
 
         Raises:
-            ImportError:  if transformers is not installed.
-            RuntimeError: if model is already loaded.
+            ImportError: If transformers is not installed.
+            RuntimeError: If model is already loaded or loading fails.
         """
         if self.model is not None:
             raise RuntimeError(
                 "A model is already loaded. Call unload() before loading a new one."
             )
+
+        _patch_quantization_config_repr()  # tolerate compressed-tensors VLM config repr
 
         model_id       = entry.path
         self._model_id = model_id
@@ -243,8 +344,27 @@ class HFRuntime(RuntimeBase):
         else:
             self._load_causal_lm(model_id, quant_cfg, dtype, device_map, trust_rc)
 
+        self._sanitize_generation_config()
+
         logger.info(f"[HFRuntime] '{model_id}' ready. "
                     f"Peak VRAM so far: {self.peak_vram_mb():.1f} MB")
+
+    def _sanitize_generation_config(self) -> None:
+        """Drop sampling-only fields baked into the checkpoint's generation_config.
+
+        Qwen/SmolVLM checkpoints ship temperature/top_p/top_k defaults. Our eval +
+        latency paths run greedy (``do_sample=False``), so transformers emits a noisy
+        "generation flags are not valid and may be ignored: ['temperature']" warning
+        on every call. Clearing these here silences it. The sampling path in
+        ``generate()`` (temperature > 0) re-supplies them explicitly with
+        ``do_sample=True``, so sampling still works."""
+        gc = getattr(self.model, "generation_config", None)
+        if gc is None:
+            return
+        gc.do_sample = False
+        for field in ("temperature", "top_p", "top_k"):
+            if getattr(gc, field, None) is not None:
+                setattr(gc, field, None)
 
     def _load_causal_lm(
         self,
@@ -255,27 +375,50 @@ class HFRuntime(RuntimeBase):
         trust_rc:   bool,
     ) -> None:
         """Loads a standard CausalLM model and its tokenizer."""
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            use_fast          = True,
-            trust_remote_code = trust_rc,
-        )
-        # Ensure pad token exists (required for batched generation)
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token    = self.tokenizer.eos_token
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        # Decoder-only models require LEFT padding for correct batched generation;
-        # right padding corrupts outputs and breaks prompt-length slicing.
-        self.tokenizer.padding_side = "left"
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            quantization_config = quant_cfg,
-            torch_dtype         = dtype,
-            device_map          = device_map,
-            trust_remote_code   = trust_rc,
-        )
-        self.model.eval()
+        try:
+            logger.info(f"[HFRuntime] trying to load model normally...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                use_fast          = True,
+                trust_remote_code = trust_rc,
+            )
+            # Ensure pad token exists (required for batched generation)
+            if self.tokenizer.pad_token_id is None:
+                self.tokenizer.pad_token    = self.tokenizer.eos_token
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            # Decoder-only models require LEFT padding for correct batched generation;
+            # right padding corrupts outputs and breaks prompt-length slicing.
+            self.tokenizer.padding_side = "left"
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id, **_model_load_kwargs(quant_cfg, dtype, device_map, trust_rc),
+            )
+            self.model.eval()
+
+        except:
+            logger.info(f"[HFRuntime] Trying to load compressed model states...")
+            compressed = _detect_compressed(model_id)
+
+            self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+            if compressed:
+                try:
+                    import compressed_tensors  # noqa: F401 — activates hooks
+                except ImportError:
+                    raise ImportError(
+                        "compressed-tensors is required for pack-quantized models.\n"
+                        "Install: pip install llmcompressor"
+                    )
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id, torch_dtype=dtype, device_map="auto"
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id, torch_dtype=dtype, device_map="auto"
+                )
+
+            self.model.eval()
 
     def _load_vlm(
         self,
@@ -286,16 +429,25 @@ class HFRuntime(RuntimeBase):
         trust_rc:   bool,
     ) -> None:
         """
-        Loads a LLaVA-style VLM via AutoProcessor.
-        Falls back to AutoModelForCausalLM if LlavaForConditionalGeneration
-        is unavailable for the requested model.
+        Loads a vision-language model via AutoModelForImageTextToText.
+
+        This is the generic image-text-to-text class that resolves the correct
+        architecture for modern VLMs — Qwen2.5-VL (Qwen2_5_VLForConditionalGeneration),
+        LLaVA, SmolVLM, HunyuanOCR (custom, via trust_remote_code), etc. The older
+        LlavaForConditionalGeneration path only worked for LLaVA-style models and
+        produced wrong inputs for Qwen/Hunyuan.
         """
         _require_pil()
 
-        self.processor = AutoProcessor.from_pretrained(
-            model_id,
-            trust_remote_code = trust_rc,
-        )
+        # HunyuanOCR's processor needs use_fast=False; try fast first, fall back.
+        try:
+            self.processor = AutoProcessor.from_pretrained(
+                model_id, trust_remote_code=trust_rc,
+            )
+        except Exception:
+            self.processor = AutoProcessor.from_pretrained(
+                model_id, trust_remote_code=trust_rc, use_fast=False,
+            )
         self.tokenizer = self.processor.tokenizer
 
         if self.tokenizer.pad_token_id is None:
@@ -303,26 +455,18 @@ class HFRuntime(RuntimeBase):
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = "left"
 
-        # Try LLaVA first, fall back to generic CausalLM
         try:
-            self.model = LlavaForConditionalGeneration.from_pretrained(
-                model_id,
-                quantization_config = quant_cfg,
-                torch_dtype         = dtype,
-                device_map          = device_map,
-                trust_remote_code   = trust_rc,
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_id, **_model_load_kwargs(quant_cfg, dtype, device_map, trust_rc),
             )
-        except (ValueError, OSError):
+        except Exception:
             logger.warning(
-                f"[HFRuntime] LlavaForConditionalGeneration failed for '{model_id}'. "
-                "Falling back to AutoModelForCausalLM."
+                f"[HFRuntime] AutoModelForImageTextToText failed for '{model_id}'. "
+                "Falling back to AutoModelForCausalLM (trust_remote_code).",
+                exc_info=True,
             )
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                quantization_config = quant_cfg,
-                torch_dtype         = dtype,
-                device_map          = device_map,
-                trust_remote_code   = trust_rc,
+                model_id, **_model_load_kwargs(quant_cfg, dtype, device_map, True),
             )
 
         self.model.eval()
@@ -486,7 +630,12 @@ class HFRuntime(RuntimeBase):
         max_new_tokens: int,
     ) -> str:
         """
-        Multimodal generation for LLaVA-style VLMs.
+        Multimodal generation for modern VLMs (Qwen2.5-VL, LLaVA, SmolVLM, Hunyuan…).
+
+        Builds a chat message with image + text content and renders it through the
+        processor's chat template so the correct image-placeholder tokens are
+        inserted. Raw ``processor(text=..., images=...)`` (the old path) does NOT
+        insert those tokens for Qwen/Hunyuan and produces a token/feature mismatch.
 
         Args:
             image:          PIL.Image.Image or path string.
@@ -510,20 +659,44 @@ class HFRuntime(RuntimeBase):
 
         _require_pil()
 
-        # Ensure we have a PIL image
         if isinstance(image, str):
             image = PILImage.open(image).convert("RGB")
-        elif not isinstance(image, PILImage.Image):
+        elif isinstance(image, PILImage.Image):
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+        else:
             raise TypeError(
                 f"image must be a PIL.Image or a file path string, "
                 f"got {type(image).__name__}."
             )
 
-        inputs = self.processor(
-            text          = prompt,
-            images        = image,
-            return_tensors = "pt",
-        ).to(self._device)
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text",  "text": prompt},
+            ],
+        }]
+
+        # Preferred: chat template tokenizes + inserts image tokens in one call.
+        try:
+            inputs = self.processor.apply_chat_template(
+                messages,
+                add_generation_prompt = True,
+                tokenize              = True,
+                return_dict           = True,
+                return_tensors        = "pt",
+            ).to(self._device)
+        except Exception:
+            # Fallback: render template to text, then call processor with images.
+            text = self.processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False,
+            )
+            inputs = self.processor(
+                text=[text], images=[image], return_tensors="pt",
+            ).to(self._device)
+
+        prompt_len = inputs["input_ids"].shape[1]
 
         with torch.no_grad():
             output_ids = self.model.generate(
@@ -531,10 +704,8 @@ class HFRuntime(RuntimeBase):
                 max_new_tokens = max_new_tokens,
                 do_sample      = False,
                 pad_token_id   = self.tokenizer.pad_token_id,
-                eos_token_id   = self.tokenizer.eos_token_id,
             )
 
-        prompt_len = inputs["input_ids"].shape[1]
         return self.tokenizer.decode(
             output_ids[0][prompt_len:], skip_special_tokens=True
         )
@@ -599,6 +770,7 @@ class HFRuntime(RuntimeBase):
                 out = self.model.generate(
                     **inputs,
                     max_new_tokens          = OUTPUT_TOKENS,
+                    min_new_tokens          = OUTPUT_TOKENS,   # force full length for stable TPOT
                     do_sample               = False,
                     return_dict_in_generate = True,
                     output_scores           = True,
@@ -696,6 +868,7 @@ class HFRuntime(RuntimeBase):
                         self.model.generate(
                             **inputs,
                             max_new_tokens = output_len,
+                            min_new_tokens = output_len,   # force full length (no early EOS) for stable tok/s
                             do_sample      = False,
                             pad_token_id   = self.tokenizer.pad_token_id,
                         )
@@ -763,6 +936,116 @@ class HFRuntime(RuntimeBase):
         if not torch.cuda.is_available():
             return 0.0
         return torch.cuda.memory_allocated() / (1024 ** 2)
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # Max context probe
+    # ════════════════════════════════════════════════════════════════════════════
+
+    def _model_max_positions(self) -> Optional[int]:
+        """Best-effort read of the model's max position embeddings (handles VLM text_config)."""
+        cfg = getattr(self.model, "config", None)
+        if cfg is None:
+            return None
+        for obj in (cfg, getattr(cfg, "text_config", None), getattr(cfg, "llm_config", None)):
+            if obj is None:
+                continue
+            v = getattr(obj, "max_position_embeddings", None)
+            if isinstance(v, int) and v > 0:
+                return v
+        return None
+
+    def measure_max_context(
+        self,
+        start:     int = 1024,
+        hard_cap:  int = 131072,
+        run_forward: bool = True,
+    ) -> dict:
+        """
+        Probe the largest prompt length the loaded model can process on this GPU.
+
+        Doubles the sequence length from ``start`` until either a forward pass OOMs
+        or the model's ``max_position_embeddings`` cap is reached, then binary-searches
+        between the last success and first failure for the precise boundary.
+
+        Args:
+            start:       Initial sequence length to try.
+            hard_cap:    Absolute ceiling regardless of model config (safety bound).
+            run_forward: If True, runs an actual forward pass (real OOM boundary).
+                         If False, only reports the model's configured max length.
+
+        Returns:
+            {
+                "model_max_positions": int | None,   # config cap
+                "measured_max_tokens": int | None,    # largest len that ran (None if not probed)
+                "oom_at_tokens":       int | None,    # first len that OOM'd
+                "capped_by":           "config" | "oom" | "hard_cap" | "config_only",
+            }
+        """
+        self._check_loaded()
+        model_max = self._model_max_positions()
+        ceiling = min(hard_cap, model_max) if model_max else hard_cap
+
+        if not run_forward or not torch.cuda.is_available():
+            return {
+                "model_max_positions": model_max,
+                "measured_max_tokens": None,
+                "oom_at_tokens":       None,
+                "capped_by":           "config_only",
+            }
+
+        vocab = int(getattr(self.model.config, "vocab_size", 32000) or 32000)
+
+        def _fits(length: int) -> bool:
+            try:
+                ids = torch.randint(0, vocab, (1, length), device=self._device)
+                with torch.no_grad():
+                    self.model(input_ids=ids)
+                del ids
+                torch.cuda.empty_cache()
+                return True
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    torch.cuda.empty_cache()
+                    return False
+                raise
+
+        last_ok: Optional[int] = None
+        first_fail: Optional[int] = None
+        length = start
+        # Exponential growth phase.
+        while length <= ceiling:
+            if _fits(length):
+                last_ok = length
+                length *= 2
+            else:
+                first_fail = length
+                break
+        capped_by = "oom"
+        if first_fail is None:
+            # never OOM'd up to the ceiling
+            capped_by = "config" if (model_max and ceiling == model_max) else "hard_cap"
+            return {
+                "model_max_positions": model_max,
+                "measured_max_tokens": last_ok,
+                "oom_at_tokens":       None,
+                "capped_by":           capped_by,
+            }
+
+        # Binary-search between last_ok and first_fail for the precise boundary.
+        lo = last_ok or start // 2
+        hi = first_fail
+        while hi - lo > max(256, lo // 16):
+            mid = (lo + hi) // 2
+            if _fits(mid):
+                lo = mid
+            else:
+                hi = mid
+        return {
+            "model_max_positions": model_max,
+            "measured_max_tokens": lo,
+            "oom_at_tokens":       first_fail,
+            "capped_by":           "oom",
+        }
 
     # ════════════════════════════════════════════════════════════════════════════
     # Extras: score_choices (used by eval_mmlu_tiny)

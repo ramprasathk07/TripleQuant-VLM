@@ -19,7 +19,7 @@ models:
     max_model_len: 2048
 
   - name: tinyllama-1b-awq-w4a16
-    path: ./tinyllama-1b-awq-modelopt/TinyLlama-1.1B-Chat-v1.0-modelopt-awq-W4A16
+    path: ./outputs/tinyllama-1b-awq-llmcompressor/TinyLlama-1.1B-Chat-v1.0-llm_compressor-gptq-W8A8
     model_type: llm
     is_local: true
     is_compressed: true

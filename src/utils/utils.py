@@ -9,7 +9,7 @@ try:
 except ImportError:
     HF_AVAILABLE = False
 
-
+   
 # ════════════════════════════════════════════════════════════════════════════════
 # 2.2.1  LaTeX Normalization
 # ════════════════════════════════════════════════════════════════════════════════
@@ -207,16 +207,20 @@ def load_latex_ocr(
         seed:        Sampling seed.
 
     Returns:
-        Dataset with columns: 'image', 'formula'.
+        Dataset with columns: 'image', 'text'.
+
+    Note:
+        linxy/LaTeX_OCR is multi-config; the 'full' config is used (it exposes
+        train/validation/test — the 'default' config is train-only).
 
     Example:
         >>> ds = load_latex_ocr(num_samples=50)
-        >>> ds[0]["formula"]
+        >>> ds[0]["text"]
         '\\frac{a}{b} + c^{2}'
     """
     return load_hf_dataset(
         name="linxy/LaTeX_OCR",
-        subset=None,
+        subset="full",
         split=split,
         num_samples=num_samples,
         seed=seed,

@@ -1,8 +1,9 @@
+# Qwen3-4B-Thinking · AWQ · INT4 weight-only (W4A16) · llm_compressor
 method: awq
-backend: modelopt
+backend: llm_compressor
 
 model:
-  model_id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  model_id: Qwen/Qwen3-4B-Thinking-2507
   torch_dtype: bfloat16
   device_map: auto
   trust_remote_code: false
@@ -13,26 +14,22 @@ scheme:
   scheme: W4A16
   group_size: 128
   symmetric: true
-  observer: percentile
-  per_channel: false
+  per_channel: false          # AWQ stays on the group strategy
+  observer: mse
   targets: ["Linear"]
-  ignore:
-    - lm_head
+  ignore: ["lm_head"]
 
 calibration:
   dataset_name: HuggingFaceH4/ultrachat_200k
   split: train_sft
-  num_samples: 256
-  max_seq_len: 1024
+  num_samples: 128
+  max_seq_len: 2048
   seed: 42
 
 output:
-  output_dir: ./tinyllama-1b-awq-modelopt
+  output_dir: ./outputs/qwen3-4b-thinking/awq-w4a16
   save_compressed: true
   save_processor: true
-
-smoothquant:
-  enabled: false
 
 awq:
   duo_scaling: true

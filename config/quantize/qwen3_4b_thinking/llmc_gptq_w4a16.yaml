@@ -1,0 +1,37 @@
+# Qwen3-4B-Thinking · GPTQ · INT4 weight-only (W4A16) · llm_compressor
+method: gptq
+backend: llm_compressor
+
+model:
+  model_id: Qwen/Qwen3-4B-Thinking-2507
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  model_type: llm
+  modality: text
+
+scheme:
+  scheme: W4A16
+  group_size: 128
+  symmetric: true
+  actorder: true              # activation ordering (valid on group strategy)
+  per_channel: false
+  observer: mse
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  num_samples: 128
+  max_seq_len: 2048
+  seed: 42
+
+output:
+  output_dir: ./outputs/qwen3-4b-thinking/gptq-w4a16
+  save_compressed: true
+  save_processor: true
+
+gptq:
+  dampening_frac: 0.01
+  block_size: 128

@@ -1,0 +1,36 @@
+# Qwen3-4B-Thinking · GPTQ · INT8 weight + INT8 dynamic act (W8A8) · llm_compressor
+method: gptq
+backend: llm_compressor
+
+model:
+  model_id: Qwen/Qwen3-4B-Thinking-2507
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  model_type: llm
+  modality: text
+
+scheme:
+  # W8A8 preset = INT8 weights (per-channel) + INT8 activations (per-token, dynamic).
+  scheme: W8A8
+  symmetric: true
+  per_channel: false          # preset already uses channel weight strategy
+  observer: mse
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  num_samples: 128
+  max_seq_len: 2048
+  seed: 42
+
+output:
+  output_dir: ./outputs/qwen3-4b-thinking/gptq-w8a8
+  save_compressed: true
+  save_processor: true
+
+gptq:
+  dampening_frac: 0.01
+  block_size: 128

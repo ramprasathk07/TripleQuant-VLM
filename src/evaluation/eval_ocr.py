@@ -102,15 +102,61 @@ _DEFAULT_OCR_PROMPT = (
     "Respond with only the LaTeX expression, nothing else."
 )
 
+# Known OCR datasets → column mapping + recommended prompt. Auto-detect covers
+# the rest, so this is just a fast path / override.
+# NOTE: "config" is the HF dataset config/subset name. linxy/LaTeX_OCR is a
+# multi-config hub dataset — load_dataset REQUIRES a config name, and only the
+# "full"/"small"/"synthetic_handwrite" configs expose train/validation/test
+# (the "default" config is train-only). Omitting it (the old behaviour) raised
+# ValueError at load → all OCR evals hard-failed.
+OCR_DATASET_REGISTRY: dict[str, dict] = {
+    "linxy/LaTeX_OCR":    {"image": "image", "text": "text",         "split": "test", "config": "full"},
+    "unsloth/LaTeX_OCR":  {"image": "image", "text": "text",         "split": "test"},
+    "getomni-ai/ocr-benchmark": {"image": "image", "text": "ground_truth", "split": "test"},
+}
+
+# Candidate column names for auto-detection when a field is not given/known.
+_IMAGE_CANDIDATES = ("image", "img", "pixel_values", "image_path")
+_TEXT_CANDIDATES  = ("text", "formula", "latex", "label", "caption",
+                     "answer", "ground_truth", "markdown", "transcription")
+
+
+def _resolve_ocr_fields(
+    columns: list[str],
+    dataset_name: str,
+    image_field: Optional[str],
+    text_field: Optional[str],
+) -> tuple[str, str]:
+    """Resolve (image_col, text_col) from explicit args → registry → auto-detect."""
+    reg = OCR_DATASET_REGISTRY.get(dataset_name, {})
+    img = image_field or reg.get("image")
+    txt = text_field  or reg.get("text")
+
+    if img not in columns:
+        img = next((c for c in _IMAGE_CANDIDATES if c in columns), None)
+    if txt not in columns:
+        txt = next((c for c in _TEXT_CANDIDATES if c in columns), None)
+
+    if img is None or txt is None:
+        raise ValueError(
+            f"Could not resolve OCR image/text columns for '{dataset_name}'. "
+            f"Available: {columns}. Set datasets.ocr_image_field / ocr_text_field."
+        )
+    logger.info("OCR fields resolved: image='%s' text='%s'", img, txt)
+    return img, txt
+
 
 def eval_ocr(
     runtime,
     dataset_name:    str           = "linxy/LaTeX_OCR",
     num_samples:     int           = 100,
     max_new_tokens:  int           = 256,
-    split:           str           = "test",
+    split:           Optional[str] = None,
     seed:            int           = 42,
     prompt_template: Optional[str] = None,
+    image_field:     Optional[str] = None,
+    text_field:      Optional[str] = None,
+    subset:          Optional[str] = None,
 ) -> dict:
     """
     Evaluates a VLM runtime on an OCR dataset (image → LaTeX).
@@ -151,21 +197,33 @@ def eval_ocr(
 
     prompt = prompt_template or _DEFAULT_OCR_PROMPT
 
+    reg = OCR_DATASET_REGISTRY.get(dataset_name, {})
+    # Resolve split (explicit → registry → "test").
+    if split is None:
+        split = reg.get("split", "test")
+    # Resolve config/subset (explicit → registry → None). Multi-config hub
+    # datasets (e.g. linxy/LaTeX_OCR) require this or load_dataset raises.
+    if subset is None:
+        subset = reg.get("config")
+
     # ── Load dataset ─────────────────────────────────────────────────────────
     # Oversample (×2) so we still hit num_samples if some rows are corrupt.
-    logger.info(f"Loading OCR dataset '{dataset_name}' | split={split} | n={num_samples}")
-    if dataset_name == "linxy/LaTeX_OCR":
-        dataset = load_latex_ocr(split=split, num_samples=num_samples * 2, seed=seed)
-    else:
-        dataset = load_hf_dataset(dataset_name, split=split,
-                                  num_samples=num_samples * 2, seed=seed)
+    logger.info("Loading OCR dataset '%s' | config=%s | split=%s | n=%d",
+                dataset_name, subset, split, num_samples)
+    dataset = load_hf_dataset(dataset_name, subset=subset, split=split,
+                              num_samples=num_samples * 2, seed=seed)
+
+    # ── Resolve image / text columns (explicit → registry → auto-detect) ───────
+    img_key, txt_key = _resolve_ocr_fields(
+        dataset.column_names, dataset_name, image_field, text_field,
+    )
 
     # ── Build prompts ─────────────────────────────────────────────────────────
     prompt_dicts = build_prompts(
         dataset,
         num_samples=num_samples,
-        image_key="image",
-        formula_key="formula",
+        image_key=img_key,
+        formula_key=txt_key,
         normalize=True,
         seed=seed,
     )

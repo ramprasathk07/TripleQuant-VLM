@@ -1,0 +1,64 @@
+# Benchmark: Qwen2.5-VL-3B-Instruct — FP16 baseline vs quantized variants (OCR).
+# Quality measured via OCR (CER/WER/EM) on linxy/LaTeX_OCR; HF runtime only.
+run_name: qwen2.5-vl-3b-ocr-sweep
+output_root: ./results
+runtimes: ["hf"]
+
+metrics:
+  quality_llm: []
+  quality_ocr: ["cer", "wer", "exact_match"]
+  perf:        ["ttft", "tpot", "throughput", "max_context"]
+  memory:      ["disk", "vram", "load_time"]
+
+datasets:
+  ocr_dataset:        linxy/LaTeX_OCR
+  ocr_num_samples:    200
+  ocr_max_new_tokens: 256
+
+latency:
+  batch_sizes:  [1, 4]
+  output_lens:  [128]
+  num_requests: 20
+  warmup_requests: 3
+
+models:
+  # - name: qwen2.5-vl-3b-fp16-baseline
+  #   path: Qwen/Qwen2.5-VL-3B-Instruct
+  #   is_local: false
+  #   model_type: vlm
+  #   dtype: bfloat16
+
+  - name: qwen2.5-vl-3b-awq-w4a16
+    path: ./outputs/qwen2.5-vl-3b/awq-w4a16
+    is_local: true
+    model_type: vlm
+    backend_hint: llm_compressor
+    vllm_quantization: compressed-tensors
+
+  # - name: qwen2.5-vl-3b-gptq-w4a16
+  #   path: ./outputs/qwen2.5-vl-3b/gptq-w4a16/Qwen2.5-VL-3B-Instruct-llm_compressor-gptq-W4A16
+  #   is_local: true
+  #   model_type: vlm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen2.5-vl-3b-gptq-w8a8
+  #   path: ./outputs/qwen2.5-vl-3b/gptq-w8a8/Qwen2.5-VL-3B-Instruct-llm_compressor-gptq-W8A8
+  #   is_local: true
+  #   model_type: vlm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen2.5-vl-3b-ptq-fp8
+  #   path: ./outputs/qwen2.5-vl-3b/ptq-fp8/Qwen2.5-VL-3B-Instruct-llm_compressor-ptq-FP8
+  #   is_local: true
+  #   model_type: vlm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen2.5-vl-3b-ptq-fp8-dyn
+  #   path: ./outputs/qwen2.5-vl-3b/ptq-fp8-dynamic/Qwen2.5-VL-3B-Instruct-llm_compressor-ptq-FP8_DYNAMIC
+  #   is_local: true
+  #   model_type: vlm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors

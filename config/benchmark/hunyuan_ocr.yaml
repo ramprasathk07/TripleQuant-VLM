@@ -1,0 +1,70 @@
+# Benchmark: tencent/HunyuanOCR — FP16 baseline vs quantized variants (OCR).
+# HunyuanOCR is a custom-arch VLM → trust_remote_code: true on every entry.
+run_name: hunyuan-ocr-sweep
+output_root: ./results
+runtimes: ["hf"]
+
+metrics:
+  quality_llm: []
+  quality_ocr: ["cer", "wer", "exact_match"]
+  perf:        ["ttft", "tpot", "throughput", "max_context"]
+  memory:      ["disk", "vram", "load_time"]
+
+datasets:
+  ocr_dataset:        linxy/LaTeX_OCR
+  ocr_num_samples:    200
+  ocr_max_new_tokens: 256
+
+latency:
+  batch_sizes:  [1, 4]
+  output_lens:  [128]
+  num_requests: 20
+  warmup_requests: 3
+
+models:
+  - name: hunyuan-ocr-fp16-baseline
+    path: tencent/HunyuanOCR
+    is_local: false
+    model_type: vlm
+    trust_remote_code: true
+    dtype: bfloat16
+
+  - name: hunyuan-ocr-awq-w4a16
+    path: ./outputs/hunyuan-ocr/awq-w4a16/HunyuanOCR-llm_compressor-awq-W4A16
+    is_local: true
+    model_type: vlm
+    trust_remote_code: true
+    backend_hint: llm_compressor
+    vllm_quantization: compressed-tensors
+
+  - name: hunyuan-ocr-gptq-w4a16
+    path: ./outputs/hunyuan-ocr/gptq-w4a16/HunyuanOCR-llm_compressor-gptq-W4A16
+    is_local: true
+    model_type: vlm
+    trust_remote_code: true
+    backend_hint: llm_compressor
+    vllm_quantization: compressed-tensors
+
+  - name: hunyuan-ocr-gptq-w8a8
+    path: ./outputs/hunyuan-ocr/gptq-w8a8/HunyuanOCR-llm_compressor-gptq-W8A8
+    is_local: true
+    model_type: vlm
+    trust_remote_code: true
+    backend_hint: llm_compressor
+    vllm_quantization: compressed-tensors
+
+  - name: hunyuan-ocr-ptq-fp8
+    path: ./outputs/hunyuan-ocr/ptq-fp8/HunyuanOCR-llm_compressor-ptq-FP8
+    is_local: true
+    model_type: vlm
+    trust_remote_code: true
+    backend_hint: llm_compressor
+    vllm_quantization: compressed-tensors
+
+  - name: hunyuan-ocr-ptq-fp8-dyn
+    path: ./outputs/hunyuan-ocr/ptq-fp8-dynamic/HunyuanOCR-llm_compressor-ptq-FP8_DYNAMIC
+    is_local: true
+    model_type: vlm
+    trust_remote_code: true
+    backend_hint: llm_compressor
+    vllm_quantization: compressed-tensors

@@ -1,7 +1,8 @@
-# eval_llm.py
-"""
-2.3 – LLM Text Evaluation
-Perplexity, MMLU, KL-divergence, and token-agreement metrics.
+"""LLM text quality evaluation: perplexity, MMLU, token agreement, KL-divergence.
+
+Provides sliding-window perplexity on calibration datasets (WikiText, etc.) and
+multiple-choice accuracy on MMLU subjects. Also computes logit-based agreement and
+KL-divergence between quantized and baseline models for detailed quality analysis.
 """
 
 import math
@@ -15,48 +16,51 @@ logger = logging.getLogger(__name__)
 
 
 def _runtime_supports_logits(runtime) -> bool:
-    """True if the runtime can return raw logits via forward_logits().
+    """Check if runtime can return raw logits via forward_logits().
 
     Both HF and vLLM runtimes define forward_logits(), but vLLM raises
     NotImplementedError (the engine hides logits), so a bare hasattr() check
     is insufficient — gate on the runtime name instead.
+
+    Args:
+        runtime: Runtime instance to check.
+
+    Returns:
+        True if runtime supports logit access (HFRuntime); False for vLLM or if method absent.
     """
     if not hasattr(runtime, "forward_logits"):
         return False
     return getattr(runtime, "name", "") != "vllm"
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# 2.3.1  Perplexity  (sliding-window)
-# ════════════════════════════════════════════════════════════════════════════════
-
 def compute_ppl(
     runtime,
     dataset,
     ctx_len: int = 2048,
-    stride:  int = 512,
+    stride: int = 512,
     text_key: str = "text",
     max_chunks: Optional[int] = None,
 ) -> float:
-    """
-    Computes sliding-window perplexity over a text dataset.
+    """Compute perplexity using sliding-window cross-entropy on a dataset.
 
-    Requires a logit-capable runtime (HFRuntime). vLLM hides logits, so PPL
-    is not supported there — raises ValueError telling the caller to switch.
+    Concatenates all text from the dataset, tokenizes it, and scores each token
+    using a sliding window. Each window scores only the new tokens (overlap with
+    previous window via stride), avoiding double-counting and enabling evaluation
+    on sequences longer than the model context length.
 
     Args:
-        runtime:    Runtime object exposing forward_logits().
-        dataset:    HF Dataset with a text column.
-        ctx_len:    Maximum context window length in tokens.
-        stride:     Sliding-window stride in tokens.
-        text_key:   Column name for raw text.
-        max_chunks: Optional cap on total chunks processed (for speed).
+        runtime: Runtime with tokenizer and forward_logits() (HFRuntime only).
+        dataset: HuggingFace Dataset with a text column.
+        ctx_len: Context window length (e.g., 2048).
+        stride: Sliding-window stride; must be < ctx_len (e.g., 512).
+        text_key: Column name containing text data.
+        max_chunks: Optional limit on number of chunks to process (for debugging).
 
     Returns:
-        Perplexity score (float). Lower is better.
+        Perplexity (exp of mean negative log-likelihood).
 
     Raises:
-        ValueError: If the runtime cannot expose logits (e.g. vLLM).
+        ValueError: If runtime does not support logits (vLLM) or no tokens scored.
     """
     if not _runtime_supports_logits(runtime):
         raise ValueError(
@@ -65,38 +69,41 @@ def compute_ppl(
             "use HFRuntime for perplexity evaluation."
         )
 
-    # ── Concatenate all text into one token stream ───────────────────────────
     full_text = "\n\n".join(
         row[text_key] for row in dataset if row[text_key].strip()
     )
-    encodings = runtime.tokenizer(full_text, return_tensors="pt")
-    input_ids = encodings.input_ids  # (1, total_len)
-    total_len  = input_ids.size(1)
+    encodings = runtime.tokenizer(full_text, return_tensors="pt", truncation=False,)
+    input_ids = encodings.input_ids
+    total_len = input_ids.size(1)
 
-    nlls        = []
+    nlls = []
     token_count = 0
-    chunk_idx   = 0
+    chunk_idx = 0
 
     for begin in range(0, total_len, stride):
-        end         = min(begin + ctx_len, total_len)
-        chunk_ids   = input_ids[:, begin:end]            # (1, chunk_len)
-        target_len  = end - (begin + stride if begin > 0 else begin)
+        end = min(begin + ctx_len, total_len)
+        chunk_ids = input_ids[:, begin:end]
+        chunk_len = chunk_ids.size(1)
 
-        if target_len <= 0:
-            break
+        if begin == 0:
+            score_start = 1
+        else:
+            score_start = max(1, chunk_len - stride)
 
-        # Tokens we actually score (the non-overlapping suffix)
-        score_start = chunk_ids.size(1) - target_len
+        if score_start >= chunk_len:
+            if end == total_len:
+                break
+            continue
 
-        nll = _nll_from_logits(runtime, chunk_ids, score_start)
+        target_len = chunk_len - score_start
+        loss_val = _nll_from_logits(runtime, chunk_ids, score_start, chunk_len)
 
-        nlls.append(nll * target_len)
+        nlls.append(loss_val * target_len)
         token_count += target_len
-        chunk_idx   += 1
+        chunk_idx += 1
 
         if max_chunks and chunk_idx >= max_chunks:
             break
-
         if end == total_len:
             break
 
@@ -106,28 +113,43 @@ def compute_ppl(
     avg_nll = sum(nlls) / token_count
     return math.exp(avg_nll)
 
+def _nll_from_logits(
+    runtime,
+    chunk_ids: torch.Tensor,
+    score_start: int,
+    chunk_len: int,
+) -> float:
+    """Compute mean negative log-likelihood for tokens [score_start:chunk_len].
 
-def _nll_from_logits(runtime, chunk_ids: torch.Tensor, score_start: int) -> float:
-    """Cross-entropy loss over the scoreable suffix, using forward_logits."""
+    Args:
+        runtime: Runtime instance with forward_logits method.
+        chunk_ids: Input IDs tensor of shape (1, chunk_len).
+        score_start: First token position to score (usually 1 or chunk_len - stride).
+        chunk_len: Total chunk length.
+
+    Returns:
+        Mean cross-entropy loss for the scored tokens.
+    """
     with torch.no_grad():
-        logits = runtime.forward_logits(chunk_ids)   # (1, seq, vocab)
+        logits = runtime.forward_logits(chunk_ids)
 
-    # Shift: logits[t] predicts token[t+1]
-    shift_logits = logits[:, score_start - 1 : -1, :]  # (1, target_len, vocab)
-    shift_labels = chunk_ids[:, score_start:]           # (1, target_len)
+    shift_logits = logits[:, score_start - 1 : chunk_len - 1, :]
+    shift_labels = chunk_ids[:, score_start : chunk_len]
+
+    shift_logits = shift_logits.contiguous().float()
+    shift_labels = shift_labels.contiguous().to(
+        shift_logits.device
+    ).long()
 
     loss = F.cross_entropy(
-        shift_logits.reshape(-1, shift_logits.size(-1)),
-        shift_labels.reshape(-1),
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
         reduction="mean",
     )
+
     return loss.item()
 
-
-# ════════════════════════════════════════════════════════════════════════════════
 # 2.3.2  MMLU Tiny Evaluation
-# ════════════════════════════════════════════════════════════════════════════════
-
 _CHOICE_LABELS = ["A", "B", "C", "D"]
 
 _MMLU_TEMPLATE = (
@@ -146,22 +168,25 @@ def eval_mmlu_tiny(
     num_q_per_subject: int = 100,
     seed: int = 42,
 ) -> float:
-    """
-    Evaluates LLM accuracy on MMLU multiple-choice questions.
-    Scoring is done via log-probability of each answer letter token.
+    """Evaluate LLM accuracy on MMLU multiple-choice questions.
+
+    For each question, scores the log-probability of each answer choice (A, B, C, D)
+    under the model, selects the highest-scoring choice, and compares to the gold label.
 
     Args:
-        runtime:           Runtime with forward_logits() or score_choices().
-        subject_list:      List of MMLU subjects (e.g. ['abstract_algebra']).
-        num_q_per_subject: Number of questions sampled per subject.
-        seed:              Sampling seed for reproducibility.
+        runtime: Runtime with forward_logits() (HFRuntime) or score_choices() method.
+        subject_list: List of MMLU subjects (e.g., ['abstract_algebra', 'biology']).
+        num_q_per_subject: Number of questions sampled per subject (total = len * num_q).
+        seed: Random seed for reproducible subject/question sampling.
 
     Returns:
+        Accuracy as a float (0.0-1.0).
         Accuracy in [0, 1]. Higher is better.
     """
     correct = 0
     total   = 0
 
+    #Need progress bar with proper label
     for subject in subject_list:
         try:
             ds = load_mmlu(subject=subject, split="test",
@@ -227,10 +252,8 @@ def _score_mmlu_choices(runtime, prompt: str) -> str:
     return best_label
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# 2.3.3  Logit KL Divergence
-# ════════════════════════════════════════════════════════════════════════════════
 
+# 2.3.3  Logit KL Divergence
 def eval_logit_kl(
     runtime,
     baseline_logits_dict: dict[str, torch.Tensor],
@@ -281,10 +304,8 @@ def eval_logit_kl(
     return sum(kl_scores) / len(kl_scores) if kl_scores else 0.0
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# 2.3.4  Token Agreement
-# ════════════════════════════════════════════════════════════════════════════════
 
+# 2.3.4  Token Agreement
 def eval_token_agreement(
     runtime,
     baseline_outputs: dict[str, str],
@@ -321,10 +342,8 @@ def eval_token_agreement(
     return matches / total if total > 0 else 0.0
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# 2.3.5  Convenience: evaluate all metrics and pack into a result dict
-# ════════════════════════════════════════════════════════════════════════════════
 
+# 2.3.5  Convenience: evaluate all metrics and pack into a result dict
 def run_llm_eval(
     runtime,
     subject_list: list[str],

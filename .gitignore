@@ -7,7 +7,7 @@ __pycache__/
 *.so
 .venv/
 *.bat 
-
+.venv_*
 implementation_planTTTQUANt
 # Distribution / packaging
 .Python

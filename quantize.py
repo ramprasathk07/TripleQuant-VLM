@@ -1,6 +1,11 @@
 #!/usr/bin/env python
-# quantize.py - Main entry point for model quantization
-"""
+"""Main entry point for model quantization.
+
+This module orchestrates a complete quantization workflow: loading a quantization
+configuration from YAML, instantiating the appropriate backend (llm_compressor or
+modelopt), loading the model from Hugging Face, and running quantization with
+calibration data. The quantized model is saved to a descriptive output directory.
+
 Usage:
     python quantize.py --config path/to/config.yaml
 """
@@ -16,7 +21,6 @@ import yaml
 from src.config.schemas import QuantizeConfig
 from src.quantization.factory import get_quantizer
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -25,7 +29,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def main():
+def main() -> None:
+    """Load config, instantiate quantizer, and run quantization workflow.
+
+    Parses command-line arguments for a YAML config file, validates the
+    configuration, routes to the appropriate backend, loads the model, and
+    invokes quantization with calibration data. Exits with code 1 on config
+    file not found or validation failure.
+
+    Raises:
+        SystemExit: If config file not found or configuration is invalid.
+    """
     parser = argparse.ArgumentParser(description="Quantize a model using a YAML configuration.")
     parser.add_argument(
         "--config", "-c",
@@ -35,7 +49,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load YAML config
     if not args.config.exists():
         logger.error("Config file not found: %s", args.config)
         sys.exit(1)
@@ -43,24 +56,19 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         config_dict = yaml.safe_load(f)
 
-    # Validate and create config object
     try:
         config = QuantizeConfig.model_validate(config_dict)
     except Exception as e:
         logger.error("Invalid configuration: %s", e)
         sys.exit(1)
 
-    # Log the chosen backend and method
     logger.info("Using backend: %s, method: %s", config.backend, config.method)
 
-    # Instantiate the appropriate quantizer (model not yet loaded)
     quantizer = get_quantizer(config)
 
-    # Load model (and processor/tokenizer) from HuggingFace
     logger.info("Loading model: %s", config.model.model_id)
     quantizer.load_model()
 
-    # Run quantization
     logger.info("Starting quantization...")
     quantizer.quantize()
 

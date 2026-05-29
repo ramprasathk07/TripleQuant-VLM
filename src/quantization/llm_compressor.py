@@ -14,7 +14,8 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.awq import AWQModifier
 from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
-from src.config.schemas import QuantizeConfig
+from compressed_tensors.quantization import preset_name_to_scheme
+from src.config.schemas import QuantizeConfig, _MODELOPT_ONLY_SCHEMES
 from .base import BaseQuantizer
 
 logger = logging.getLogger(__name__)
@@ -74,18 +75,28 @@ class LLMCompressorQuantizer(BaseQuantizer):
             ValueError: If dataset split, image column, or text column cannot be resolved.
         """
         cal = self.config.calibration
-        split = getattr(cal, 'split', 'train')
+        split = getattr(cal, 'split', 'test')
         if "[:" not in split:
             split = f"{split}[:{cal.num_samples}]"
 
+        # Multi-config hub datasets (e.g. linxy/LaTeX_OCR) require a config name.
+        subset = getattr(cal, 'subset', None)
         try:
-            ds = load_dataset(cal.dataset_name, split=split)
+            ds = load_dataset(cal.dataset_name, subset, split=split)
         except ValueError as e:
-            from datasets import get_dataset_split_names
-            splits = get_dataset_split_names(cal.dataset_name)
+            from datasets import get_dataset_config_names, get_dataset_split_names
+            try:
+                configs = get_dataset_config_names(cal.dataset_name)
+            except Exception:
+                configs = []
+            try:
+                splits = get_dataset_split_names(cal.dataset_name, subset)
+            except Exception:
+                splits = []
             raise ValueError(
-                f"Split '{split}' not found. Available splits: {splits}. "
-                f"Please set 'calibration.split' in your config."
+                f"Could not load '{cal.dataset_name}' (config={subset!r}, split='{split}'). "
+                f"Available configs: {configs}. Available splits: {splits}. "
+                f"Set 'calibration.subset' and/or 'calibration.split' in your config."
             ) from e
 
         ds = ds.shuffle(seed=cal.seed)
@@ -312,125 +323,131 @@ class LLMCompressorQuantizer(BaseQuantizer):
                 collated[key] = torch.tensor(value)
         return collated
 
-    def _build_recipe(self) -> List[Any]:
-        """Build llmcompressor modifier recipe from QuantizeConfig.
+    def _build_quant_config(self) -> Dict[str, Any]:
+        """Resolve the weight/activation quant config for the configured scheme.
 
-        Constructs modifiers for SmoothQuant (if enabled), then AWQ/GPTQ/PTQ
-        based on config.method, with merged ignore patterns and quantization config.
+        Uses compressed-tensors preset schemes as the source of truth (correct
+        int/float dtype, strategy, group size and dynamic flags for every
+        supported scheme: W4A16, W8A8, W4A8, FP8, FP8_DYNAMIC, NVFP4, …), then
+        overlays the user-supplied knobs where they are safe for the resolved
+        strategy. This is what makes every llm_compressor-supported format work
+        through one code path instead of an INT-only hand-built dict.
 
         Returns:
-            List of llmcompressor Modifier instances to pass to oneshot().
+            A config_groups entry: ``{"weights": {...}, "input_activations": {...}}``
+            (the ``input_activations`` key is present only when the scheme quantizes
+            activations).
 
         Raises:
-            ValueError: If scheme is unsupported for llm_compressor backend.
+            ValueError: If the scheme is modelopt-only or unknown to llm_compressor.
         """
         scheme = self.config.scheme.scheme
-        group_size = self.config.scheme.group_size
-        symmetric = self.config.scheme.symmetric
-        actorder = self.config.scheme.actorder
         targets = self.config.scheme.targets
+        sc = self.config.scheme
 
-        observer = self.config.scheme.observer
-        supported_observers = {"mse", "minmax"}
-        if observer not in supported_observers:
-            logger.warning(
-                "Observer '%s' not supported by llmcompressor, falling back to 'mse'", observer
-            )
-            observer = "mse"
-
-        per_channel = self.config.scheme.per_channel
-        dynamic_activations = self.config.scheme.dynamic_activations
-
-        # Bit width
-        if scheme.startswith("W4"):
-            bits = 4
-        elif scheme.startswith("W8"):
-            bits = 8
-        else:
+        if scheme in _MODELOPT_ONLY_SCHEMES:
             raise ValueError(
-                f"Unsupported scheme '{scheme}' for backend='llm_compressor'. "
-                f"FP8/NVFP4/MXFP4 schemes require backend='modelopt'."
+                f"scheme='{scheme}' is modelopt-only; use backend='modelopt'."
             )
+        try:
+            preset = preset_name_to_scheme(scheme, targets)
+        except Exception as e:
+            raise ValueError(
+                f"scheme='{scheme}' is not supported by llm_compressor: {e}"
+            ) from e
 
-        strategy = "channel" if per_channel else "group"
+        weights = preset.weights.model_dump(exclude_none=True)
+        acts = (
+            preset.input_activations.model_dump(exclude_none=True)
+            if preset.input_activations is not None
+            else None
+        )
 
-        # Build unified quant config — this goes INTO the algorithm modifier
-        quant_config = {
-            "targets": targets,
-            "weights": {
-                "num_bits": bits,
-                "type": "int",
-                "symmetric": symmetric,
-                "group_size": group_size,
-                "strategy": strategy,
-                "dynamic": False,
-                "actorder": actorder or None,
-                "observer": observer,
-            }
-        }
+        # ── Overlay user knobs (only where they don't contradict the dtype/strategy) ──
+        is_int = weights.get("type") == "int"
 
-        if "A8" in scheme:
-            quant_config["activations"] = {
-                "num_bits": 8,
-                "type": "int",
-                "symmetric": symmetric,
-                "dynamic": dynamic_activations,
-                "observer": observer,
-            }
-            if dynamic_activations:
-                logger.info("Using dynamic activation quantization")
+        # per_channel forces channel strategy (int weight-only schemes); drops group_size.
+        if sc.per_channel and is_int:
+            weights["strategy"] = "channel"
+            weights.pop("group_size", None)
+        # group_size override only meaningful for grouped strategies.
+        elif weights.get("strategy") == "group" and sc.group_size:
+            weights["group_size"] = sc.group_size
 
-        modifiers = []
+        # symmetric / observer only for INT weights — float schemes (FP8/NVFP4)
+        # require symmetric=True and use their preset observer.
+        if is_int:
+            weights["symmetric"] = sc.symmetric
+            if not weights.get("dynamic", False) and sc.observer:
+                weights["observer"] = sc.observer
 
-        # ── 1. SmoothQuant (must come first, before any quantization) ────────────
+        # actorder is a GPTQ-only heuristic and is only valid for group strategy.
+        if (
+            self.config.method == "gptq"
+            and is_int
+            and weights.get("strategy") == "group"
+        ):
+            weights["actorder"] = bool(sc.actorder)
+
+        # Each config_groups entry is a full QuantizationScheme — it carries its
+        # own targets (required by the modifier's config_groups schema).
+        group_config: Dict[str, Any] = {"targets": list(targets), "weights": weights}
+        if acts is not None:
+            group_config["input_activations"] = acts
+        return group_config
+
+    def _build_recipe(self) -> List[Any]:
+        """Build the llmcompressor modifier recipe from the active config.
+
+        Constructs an optional SmoothQuant modifier followed by the algorithm
+        modifier (AWQ / GPTQ) or a plain QuantizationModifier (PTQ). The quant
+        config lives inside ``config_groups``; ``targets`` and ``ignore`` sit on
+        the modifier itself (NOT inside config_groups).
+
+        Returns:
+            List of llmcompressor Modifier instances for oneshot().
+        """
+        targets = self.config.scheme.targets
+        ignore = self._merged_ignore()
+        group_config = self._build_quant_config()
+        config_groups = {"group_0": group_config}
+
+        modifiers: List[Any] = []
+
+        # SmoothQuant first (must precede any quantization modifier).
         sq = self.config.smoothquant
         if sq and sq.enabled:
-            if "A8" not in scheme:
-                raise ValueError(
-                    "SmoothQuant requires activation quantization (scheme with A8)"
-                )
             mappings = [(entry[0], entry[1]) for entry in sq.mappings]
-            modifiers.append(SmoothQuantModifier(
-                smoothing_strength=sq.strength,
-                mappings=mappings,
-            ))
-            logger.info(
-                "Enabled SmoothQuant with strength=%.2f on %d mapping groups",
-                sq.strength, len(mappings)
+            modifiers.append(
+                SmoothQuantModifier(smoothing_strength=sq.strength, mappings=mappings)
             )
+            logger.info("Enabled SmoothQuant (strength=%.2f, %d mappings)",
+                        sq.strength, len(mappings))
 
-        # ── 2. Algorithm modifier — owns config_groups and ignore ────────────────
-        #       NO separate QuantizationModifier when using GPTQ or AWQ
+        # Algorithm modifier: AWQ / GPTQ own config_groups; PTQ uses QuantizationModifier.
         if self.config.method == "awq":
             duo = self.config.awq.duo_scaling if self.config.awq else False
             modifiers.append(AWQModifier(
-                duo_scaling=duo,
-                ignore=self._merged_ignore(),
-                config_groups={"group_0": quant_config},  # ← quant config lives here
+                targets=targets, ignore=ignore,
+                config_groups=config_groups, duo_scaling=duo,
             ))
-            logger.info("Using AWQ with duo_scaling=%s", duo)
-
+            logger.info("Using AWQ (duo_scaling=%s)", duo)
         elif self.config.method == "gptq":
-            damp = self.config.gptq.dampening_frac if self.config.gptq else 0.01
+            gptq = self.config.gptq
             modifiers.append(GPTQModifier(
-                dampening_frac=damp,
-                # sequential_update removed in llmcompressor 0.6.0 — no longer a valid field
-                ignore=self._merged_ignore(),
-                config_groups={"group_0": quant_config},
+                targets=targets, ignore=ignore, config_groups=config_groups,
+                dampening_frac=gptq.dampening_frac if gptq else 0.01,
+                block_size=gptq.block_size if gptq else 128,
             ))
-            logger.info("Using GPTQ with dampening_frac=%.4f", damp)
-
-        else:
-            # PTQ only — QuantizationModifier is correct here since there's no algo modifier
+            logger.info("Using GPTQ (dampening_frac=%.4f)",
+                        gptq.dampening_frac if gptq else 0.01)
+        else:  # ptq
             modifiers.append(QuantizationModifier(
-                ignore=self._merged_ignore(),
-                config_groups={"group_0": quant_config},
+                targets=targets, ignore=ignore, config_groups=config_groups,
             ))
-            logger.info("Using plain PTQ (no algorithm modifier)")
+            logger.info("Using plain PTQ (QuantizationModifier)")
 
-        logger.info(
-            "Quantization config: bits=%d, group_size=%d, symmetric=%s, "
-            "strategy=%s, observer=%s",
-            bits, group_size, symmetric, strategy, observer,
-        )
+        logger.info("Recipe scheme=%s weights=%s",
+                    self.config.scheme.scheme, group_config["weights"])
         return modifiers
+

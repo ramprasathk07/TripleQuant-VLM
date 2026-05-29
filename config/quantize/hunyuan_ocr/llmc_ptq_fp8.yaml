@@ -1,0 +1,33 @@
+﻿# tencent/HunyuanOCR (1B OCR VLM) Â· PTQ Â· FP8 static Â· llm_compressor
+method: ptq
+backend: llm_compressor
+
+model:
+  model_id: tencent/HunyuanOCR
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: true
+  model_type: vlm
+  modality: vision_text
+
+scheme:
+  scheme: FP8
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: linxy/LaTeX_OCR
+  subset: full              # required: LaTeX_OCR is multi-config; 'full' has train/val/test
+  dataset_format: image_text
+  split: train
+  image_field: image
+  text_field: text             # real column is 'text', not 'formula'
+  instruction_prompt: "Read the text in the image."
+  num_samples: 64
+  max_seq_len: 2048
+  seed: 42
+
+output:
+  output_dir: ./outputs/hunyuan-ocr/ptq-fp8
+  save_compressed: true
+  save_processor: true
