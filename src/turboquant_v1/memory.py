@@ -3,8 +3,8 @@ from __future__ import annotations
 import torch
 from typing import Optional, NamedTuple
 
-from turboquant.quantize import TurboQuant, ProdQuantized
-from turboquant.kv_cache import quantize_V, ValueQuantized
+from turboquant_v1.quantize import TurboQuant, ProdQuantized
+from turboquant_v1.kv_cache import quantize_V, ValueQuantized
 
 
 class FlatCache(NamedTuple):

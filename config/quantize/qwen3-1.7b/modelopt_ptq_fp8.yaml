@@ -1,0 +1,30 @@
+# Qwen3-1.7B · ModelOpt · NVFP4 + AWQ-Lite (NVFP4_AWQ_LITE_CFG) · nvidia-modelopt
+# NVFP4 inference is Blackwell-only; quantization/export works on any CUDA GPU.
+method: awq
+backend: modelopt
+
+model:
+  model_id: Qwen/Qwen3-1.7B
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  model_type: llm
+  modality: text
+
+scheme:
+  scheme: FP8
+  group_size: 128             # unused for per-tensor FP8 (no block_sizes)
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  num_samples: 128
+  max_seq_len: 2048
+  seed: 42
+
+output:
+  output_dir: ./outputs/qwen3-1-7b/modelopt-fp8
+  save_compressed: true
+  save_processor: true
