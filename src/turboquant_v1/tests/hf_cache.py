@@ -3,6 +3,16 @@ Stage 3: Full HF cache replacement for Qwen2.5-3B using TurboQuant.
 No compression yet – all tokens kept in the ring buffer for exact generation.
 """
 
+import sys
+from pathlib import Path
+
+# Allow running this file directly (`python src/turboquant_v1/tests/hf_cache.py`):
+# put the project root on sys.path so `import src...` resolves. Running a script
+# directly only adds the script's own dir to sys.path, not the repo root.
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -12,20 +22,46 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotar
 # TurboQuant imports – adjust if your package structure differs
 from src.turboquant_v1.store import CompressedKVStore
 from src.turboquant_v1.capture import KVCaptureEngine
+from src.turboquant_v1.kv_cache import dequantize_V
 
 # -------------------------- Configuration --------------------------
 MODEL_NAME = "Qwen/Qwen2.5-3B"
-RING_CAPACITY = 4096          # Keep all tokens uncompressed for now
+RING_CAPACITY = 1024          # Keep all tokens uncompressed for now
 KEY_BITS = 3                  # Will be used when compression is enabled
 VALUE_BITS = 2
-MAX_NEW_TOKENS = 50
-PROMPT = "whats the capital of India"
+
+# When True, get_full_kv decompresses the store and prepends it, so attention
+# actually runs over TurboQuant-reconstructed (lossy) KV — TQ is in the decode
+# loop. When False, attention reads the exact bf16 ring only (a sliding window
+# numerically identical to a plain bf16 cache; TQ measured for storage only).
+USE_COMPRESSED_STORE = True
+
+MAX_NEW_TOKENS = 1024
+# Force at least this many new tokens so the ring (capacity 128) overflows and the
+# compressed store actually fills — otherwise a short answer never triggers
+# compression and the report shows 1.00x. Output past the real answer degenerates
+# because get_full_kv currently reads the ring only (store not yet read back).
+MIN_NEW_TOKENS = 512
+PROMPT = "explain elaborately on whats llm and AI"
 
 # ---------------------- TurboDynamicCache --------------------------
 class TurboDynamicCache(Cache):
     """HF-compatible cache backed by one KVCaptureEngine per layer."""
+
+    # transformers >=4.55 reads these off the cache during generation. This cache
+    # has no base `layers` list and is not torch.compile-able, so pin them
+    # directly (the base `is_compileable` property iterates self.layers).
+    is_compileable = False
+
     def __init__(self, num_layers, num_kv_heads, head_dim, ring_capacity, device):
-        super().__init__()
+        # transformers >=4.55 changed Cache.__init__ to require `layer_classes`
+        # (layered-cache refactor). This cache manages its own per-layer engines
+        # and overrides every access point HF generation uses, so it does not
+        # rely on the base init — skip it when the new signature rejects no-args.
+        try:
+            super().__init__()
+        except TypeError:
+            pass
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -70,6 +106,14 @@ class TurboDynamicCache(Cache):
     def get_seq_length(self, layer_idx=0):
         return self._seq_len
 
+    def get_mask_sizes(self, cache_position, layer_idx=0):
+        # (kv_length, kv_offset) for causal-mask construction. transformers >=4.55
+        # delegates to self.layers[idx]; this cache has none, so compute directly.
+        # Called before the decoder layers run, so _seq_len is the PAST length and
+        # the current query tokens (cache_position) are added on top.
+        query_length = cache_position.shape[0]
+        return self._seq_len + query_length, 0
+
     def reorder_cache(self, beam_idx):
         raise NotImplementedError("Beam search not supported")
 
@@ -91,8 +135,13 @@ class TurboDynamicCache(Cache):
 
     def get_full_kv(self, layer_idx):
         """
-        Returns (K, V) as (T_total, Hkv, D) for the given layer.
-        Currently only from the ring buffer (store is empty).
+        Returns (K, V) as (T_total, Hkv, D) for the given layer, in chronological
+        order: TurboQuant-reconstructed store tokens (oldest) followed by the exact
+        bf16 ring tokens (most recent).
+
+        With USE_COMPRESSED_STORE the store is decompressed and prepended, so the
+        model attends over lossy TQ-reconstructed KV — TQ is genuinely in the decode
+        loop. Otherwise only the ring is returned (exact bf16 sliding window).
         """
         engine = self.engines[layer_idx]
         recent = engine.ring.peek()
@@ -102,7 +151,17 @@ class TurboDynamicCache(Cache):
             ring_k = torch.empty(0, self.num_kv_heads, self.head_dim, device=self.device)
             ring_v = torch.empty(0, self.num_kv_heads, self.head_dim, device=self.device)
 
-        # TODO: later prepend compressed tokens from engine.store.decompress(...)
+        if USE_COMPRESSED_STORE and engine.store.num_tokens > 0:
+            flat = engine.store.get_flat_cache()
+            # Keys: TurboQuant inverse. Values: group-dequant. Both -> (Hkv, T, D).
+            store_k = engine.store.quantizer.dequantize(flat.prod_q)
+            store_v = dequantize_V(flat.value_q, group_size=engine.store.value_group_size)
+            # -> (T, Hkv, D) to match the ring layout, in the cache's dtype.
+            store_k = store_k.permute(1, 0, 2).to(ring_k.dtype)
+            store_v = store_v.permute(1, 0, 2).to(ring_v.dtype)
+            return (torch.cat([store_k, ring_k], dim=0),
+                    torch.cat([store_v, ring_v], dim=0))
+
         return ring_k, ring_v
 
 
@@ -115,59 +174,125 @@ original_qwen2_attn_forward = Qwen2Attention.forward
 def patched_qwen2_attn_forward(
     self,
     hidden_states,
-    position_ids=None,
+    position_embeddings=None,
+    attention_mask=None,
     past_key_value=None,
-    output_attentions=False,
-    use_cache=False,
     cache_position=None,
     **kwargs,
 ):
-    if isinstance(past_key_value, TurboDynamicCache) and use_cache:
-        bsz, q_len, _ = hidden_states.size()
-        n_heads = model_config.num_attention_heads
-        n_kv_heads = model_config.num_key_value_heads
-        head_dim = model_config.hidden_size // n_heads
-
-        # Q projection + RoPE
-        query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
-
-        # Use the model-level rotary embedding (avoid self.rotary_emb)
-        cos, sin = model.model.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        # Append new K/V to cache (in‑place)
-        past_key_value.update(key_states, value_states, self.layer_idx)
-
-        # Get all past keys & values
-        full_k, full_v = past_key_value.get_full_kv(self.layer_idx)   # (T_total, Hkv, D)
-
-        # GQA expansion: repeat KV heads to match Q heads
-        gqa_ratio = n_heads // n_kv_heads
-        full_k = full_k.unsqueeze(0).repeat_interleave(gqa_ratio, dim=2)  # (1, T, H, D)
-        full_k = full_k.permute(0, 2, 1, 3)                               # (1, H, T, D)
-        full_v = full_v.unsqueeze(0).repeat_interleave(gqa_ratio, dim=2).permute(0, 2, 1, 3)
-
-        # Causal scaled dot‑product attention
-        attn_output = F.scaled_dot_product_attention(
-            query_states, full_k, full_v, attn_mask=None, dropout_p=0.0, is_causal=True
-        )   # (1, H, Tq, D)
-
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, None   # (output, None for attention weights)
-    else:
+    # transformers >=4.55 attention signature is
+    #   (hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+    # and the decoder passes everything by keyword, so gate on the cache type
+    # (not a `use_cache` flag, which is no longer forwarded here).
+    if not isinstance(past_key_value, TurboDynamicCache):
         return original_qwen2_attn_forward(
-            self, hidden_states, position_ids=position_ids,
-            past_key_value=past_key_value, output_attentions=output_attentions,
-            use_cache=use_cache, cache_position=cache_position, **kwargs,
+            self, hidden_states, position_embeddings, attention_mask,
+            past_key_value=past_key_value, cache_position=cache_position, **kwargs,
         )
+
+    bsz, q_len, _ = hidden_states.size()
+    cfg = getattr(self, "config", model_config)
+    n_heads = cfg.num_attention_heads
+    n_kv_heads = cfg.num_key_value_heads
+    head_dim = getattr(self, "head_dim", cfg.hidden_size // n_heads)
+
+    query_states = self.q_proj(hidden_states).view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+
+    # Use the precomputed (cos, sin) the model already built for this step; do NOT
+    # recompute from position_ids (4.55 no longer passes position_ids here).
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    # Append post-RoPE K/V to the cache (in-place), then read the full history.
+    past_key_value.update(key_states, value_states, self.layer_idx)
+    full_k, full_v = past_key_value.get_full_kv(self.layer_idx)   # (T_total, Hkv, D)
+
+    # GQA: expand KV heads to match Q heads. (T,Hkv,D) -> (1,Hq,T,D).
+    gqa_ratio = n_heads // n_kv_heads
+    full_k = full_k.unsqueeze(0).repeat_interleave(gqa_ratio, dim=2).permute(0, 2, 1, 3)
+    full_v = full_v.unsqueeze(0).repeat_interleave(gqa_ratio, dim=2).permute(0, 2, 1, 3)
+
+    # is_causal only when query and key lengths match (prefill). For a decode step
+    # (q_len == 1, kv_len == T) is_causal=True would let the single query see only
+    # key 0 — pass False so it attends the full history.
+    is_causal = q_len == full_k.shape[2] and q_len > 1
+    attn_output = F.scaled_dot_product_attention(
+        query_states, full_k, full_v, attn_mask=None, dropout_p=0.0, is_causal=is_causal,
+    )   # (1, Hq, q_len, D)
+
+    attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
+    attn_output = self.o_proj(attn_output)
+    return attn_output, None   # (output, attn_weights)
 
 # Apply the monkey-patch
 Qwen2Attention.forward = patched_qwen2_attn_forward
+
+
+# -------------------- Compression reporting ------------------------
+def compression_report(cache: "TurboDynamicCache") -> dict:
+    """Compare TurboQuant KV storage against the FP16 KV you'd keep without it.
+
+    Per layer the cache holds two segments:
+      - ring buffer: the most recent <= ring_capacity tokens, exact (bf16)
+      - compressed store: the overflow tokens, quantized to KEY_BITS / VALUE_BITS
+
+    "Without TQ" is the dense FP16 KV cache: every token kept at bf16 for both K
+    and V. The ratio is how many times smaller the TurboQuant cache is.
+
+    NOTE: today get_full_kv() reads the ring only, so the store is write-only and
+    does not feed attention (sliding window of ring_capacity). These numbers
+    measure storage; reconstructing from the store is the next step.
+    """
+    bf16_bytes = 2
+    h_kv, d = cache.num_kv_heads, cache.head_dim
+    # K and V, per token, per layer, at bf16.
+    fp16_per_token = h_kv * d * bf16_bytes * 2
+
+    ring_tokens = store_tokens = 0
+    tq_bytes = 0
+    store_only_bytes = 0
+    for eng in cache.engines:
+        r = eng.ring.size
+        s = eng.store.num_tokens
+        ring_tokens += r
+        store_tokens += s
+        sb = eng.store.memory_bytes()        # store's own estimate of packed size
+        store_only_bytes += sb
+        tq_bytes += r * fp16_per_token + sb  # ring stays bf16; store is packed
+
+    seq_len = cache.get_seq_length()
+    n_layers = len(cache.engines)
+    fp16_bytes = seq_len * fp16_per_token * n_layers      # dense FP16 cache (no TQ)
+    store_fp16_equiv = store_tokens * fp16_per_token       # FP16 cost of the compressed part
+
+    mb = 1024 * 1024
+    overall = fp16_bytes / tq_bytes if tq_bytes else float("nan")
+    store_only = store_fp16_equiv / store_only_bytes if store_only_bytes else float("nan")
+
+    print("\n" + "-" * 58)
+    print("KV cache compression report")
+    print("-" * 58)
+    print(f"  layers                 : {n_layers}")
+    print(f"  sequence length        : {seq_len} tokens")
+    print(f"  ring_capacity          : {cache.ring_capacity}  (KEY_BITS={KEY_BITS}, VALUE_BITS={VALUE_BITS})")
+    print(f"  per-layer split        : {ring_tokens // n_layers} exact (bf16) + "
+          f"{store_tokens // n_layers} compressed")
+    print(f"  FP16 KV  (without TQ)  : {fp16_bytes / mb:8.2f} MB")
+    print(f"  TurboQuant KV          : {tq_bytes / mb:8.2f} MB  "
+          f"(ring bf16 + store packed)")
+    print(f"  overall compression    : {overall:6.2f}x")
+    print(f"  compressed-segment only: {store_only:6.2f}x  "
+          f"({store_fp16_equiv / mb:.2f} MB -> {store_only_bytes / mb:.2f} MB)")
+    print("-" * 58)
+    return {
+        "seq_len": seq_len,
+        "fp16_bytes": fp16_bytes,
+        "tq_bytes": tq_bytes,
+        "overall_ratio": overall,
+        "store_only_ratio": store_only,
+    }
 
 # ---------------------- Main Generation ----------------------------
 if __name__ == "__main__":
@@ -199,6 +324,7 @@ if __name__ == "__main__":
         outputs = model.generate(
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
+            min_new_tokens=MIN_NEW_TOKENS,   # force ring overflow so the store fills
             do_sample=False,          # greedy decoding
             use_cache=True,
             past_key_values=turbo_cache,   # our custom cache
@@ -207,3 +333,5 @@ if __name__ == "__main__":
     generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     print("Generated text:")
     print(generated_text)
+
+    compression_report(turbo_cache)
