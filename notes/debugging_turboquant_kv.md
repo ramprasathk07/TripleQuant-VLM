@@ -132,33 +132,50 @@ a real bug as "expected" is worse. So decide which, cheaply, before doing more w
 - **Takeaway**: the identity test + precision sweep is the fastest bug-vs-budget
   discriminator for any compressor. Pick inputs whose difficulty you understand.
 
-### 3.2 The fix that didn't work is information
-Raising to K4/V4 *still* degenerated. A failed fix is a probe: it falsifies "low bits are
-the whole story" and forces a model-level rethink.
-- **Technique**: when a plausible fix doesn't move the needle, stop tuning and re-examine
-  assumptions. Re-read the algorithm's intended interface.
-- **What it found**: `grep` for the methods the store exposes surfaced
-  `TurboQuant.attention_score(query, quantized_key)` and `attention_scores` on the cache —
-  i.e. TurboQuant is *designed* to compute ⟨q, k⟩ directly from the quantized keys via an
-  unbiased QJL estimator. My `get_full_kv` did `dequantize → dense SDPA`, which throws that
-  estimator away and feeds raw reconstruction noise into attention.
-- **Why this is the root**: the dequantize-then-matmul path makes the model see the codec's
-  point-wise error; the estimator path is built to keep the *inner products* accurate at low
-  bits even when point-wise reconstruction is poor. Using the wrong path means the 0.43
-  key error hits attention directly — exactly the observed collapse.
-- **Takeaway**: when fixes within a mental model fail, the mental model is probably wrong.
-  Re-read the library's intended usage; a "shortcut" implementation often bypasses the very
-  mechanism that makes the method work.
+### 3.2 Verify a proposed fix's premise before building it
+Raising to K4/V4 *still* degenerated, so I formed a hypothesis: "the wiring uses
+`dequantize → dense SDPA` but TurboQuant exposes `attention_score(query, quantized_key)` —
+an estimator that should keep inner products accurate at low bits. Use that instead."
+- **Technique**: before implementing a fix, *measure its premise*. I compared the estimator
+  scores against dequantize→matmul scores on the same data:
+  ```python
+  s_est = store.quantizer.attention_score(q, flat.prod_q)
+  s_dq  = q @ store.quantizer.dequantize(flat.prod_q).transpose(-2, -1)
+  # rel-err vs true q@k.T: estimator 0.437, dequant 0.437 -> IDENTICAL
+  ```
+- **What it found**: they are the same number. The estimator is *algebraically equal* to
+  dequantize-then-matmul for a fixed QJL projection S (its benefit is variance reduction in
+  expectation over random S, not a per-call accuracy gain). The hypothesized fix was a dead
+  end — and I learned that in one cheap measurement instead of a multi-hour rewrite.
+- **Takeaway**: an appealing fix can be wrong. When a fix rests on "method X is more
+  accurate," test that claim numerically *first*. Building it then measuring wastes the most
+  time.
 
-### 3.3 Causal reasoning for the *shape* of the failure
-The output was coherent for ~130 tokens, then collapsed. That pattern is itself a clue.
-- **Reasoning**: with a 128-token exact ring, the most recent context is fine; degradation
+### 3.3 The decisive test: clean high-bit run rules out a bug
+- **Technique**: to settle "bug vs budget" definitively, push the lossy knob to near-lossless
+  and see if the symptom disappears. Ran generation at K8/V8.
+- **Result**: K8/V8 produced fully coherent text (proper ending). A clean run at high bits
+  proves there is *no integration bug* — every wiring step is correct; the only variable that
+  matters is fidelity. K8/V4 then gave clean output at a usable ~2.25x segment ratio.
+- **Why this beats more reasoning**: it's a single experiment that collapses the hypothesis
+  space. If high-bit had *also* degenerated, the bug would be in the integration, not the
+  codec. It didn't, so it's the codec/budget.
+- **Takeaway**: when unsure whether a defect is "wrong code" or "aggressive setting," set the
+  setting to its safe extreme. Symptom gone => setting; symptom stays => code.
+
+### 3.4 Causal reasoning for the *shape* of the failure
+The output was coherent for a while, then collapsed. That pattern is itself a clue.
+- **Reasoning**: with an exact ring of recent tokens, recent context is fine; degradation
   begins precisely when attention must rely on the compressed tail, and **errors compound
   across 36 layers and hundreds of positions** (softmax over many noisy logits amplifies
-  small per-key errors). The *location and progressiveness* of the failure matched the
-  hypothesis (compressed-history dependence), which corroborated the root cause.
-- **Takeaway**: don't just ask "does it fail" — ask "*where* and *how* does it fail, and is
-  that consistent with my hypothesis?" The failure's shape is evidence.
+  small per-key errors). The *location and progressiveness* matched the
+  compressed-history-fidelity hypothesis.
+- **The deeper why**: keys need ~8 bits here because the quantizer treats keys per-vector
+  with no outlier handling; transformer keys have large outlier *channels*. The KIVI fix is
+  per-channel key quantization. That's the real path to low-bit keys — a quantizer change,
+  not a wiring change.
+- **Takeaway**: don't just ask "does it fail" — ask "*where* and *how*, and is that
+  consistent with my hypothesis?" The failure's shape is evidence.
 
 ---
 
@@ -189,6 +206,8 @@ The output was coherent for ~130 tokens, then collapsed. That pattern is itself 
 
 ## Cross-references
 - `notes/turboquant_hf_cache_guide.md` — what the script does, end to end.
-- `notes/turboquant.md` — the TurboQuant algorithm and the intended fused score path.
-- The open fix: route the compressed segment through `quantizer.attention_score()` instead
-  of `dequantize → dense SDPA` (see Phase 3.2).
+- `notes/turboquant_kv_case_studies.md` — bug-by-bug study guide (this journal's companion).
+- `notes/turboquant.md` — the TurboQuant algorithm.
+- Applied fix: `KEY_BITS=8, VALUE_BITS=4` gives clean generation at ~2.25x segment. The real
+  algorithmic fix for low-bit keys is per-channel key quantization (KIVI-style), a quantizer
+  change — not the `attention_score` estimator, which is the same math as dequant (Phase 3.2).

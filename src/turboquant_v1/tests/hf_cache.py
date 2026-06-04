@@ -26,9 +26,21 @@ from src.turboquant_v1.kv_cache import dequantize_V
 
 # -------------------------- Configuration --------------------------
 MODEL_NAME = "Qwen/Qwen2.5-3B"
-RING_CAPACITY = 1024          # Keep all tokens uncompressed for now
-KEY_BITS = 3                  # Will be used when compression is enabled
+RING_CAPACITY = 256          # Keep all tokens uncompressed for now
+# Bit budget for the compressed store. The real fidelity lever here is USE_QJL,
+# not the bit count: with +QJL, K3 keys are garbage; with MSE-only, K3 keys hit
+# cos ~0.94 (see test_quant_quality.py). Measured on Qwen2.5-3B:
+#   K3/V2, MSE-only -> 5.12x segment, COHERENT  <- default
+#   K3/V2, +QJL     -> 5.12x segment, garbage
+#   K8/V4           -> 2.25x segment, clean (works regardless of QJL)
+KEY_BITS = 3
 VALUE_BITS = 2
+
+# The QJL residual stage is an unbiased *inner-product* estimator; reused for
+# point-wise key reconstruction it injects variance and RAISES error at every bit
+# width (K3 cos 0.94 -> 0.92). Skip it for the dequant/score path — MSE-only keys
+# are closer to the originals. See src/turboquant_v1/tests/test_quant_quality.py.
+USE_QJL = False
 
 # When True, get_full_kv decompresses the store and prepends it, so attention
 # actually runs over TurboQuant-reconstructed (lossy) KV — TQ is in the decode
@@ -36,12 +48,12 @@ VALUE_BITS = 2
 # numerically identical to a plain bf16 cache; TQ measured for storage only).
 USE_COMPRESSED_STORE = True
 
-MAX_NEW_TOKENS = 1024
+MAX_NEW_TOKENS = 2048
 # Force at least this many new tokens so the ring (capacity 128) overflows and the
 # compressed store actually fills — otherwise a short answer never triggers
 # compression and the report shows 1.00x. Output past the real answer degenerates
 # because get_full_kv currently reads the ring only (store not yet read back).
-MIN_NEW_TOKENS = 512
+# MIN_NEW_TOKENS = 512
 PROMPT = "explain elaborately on whats llm and AI"
 
 # ---------------------- TurboDynamicCache --------------------------
@@ -154,7 +166,17 @@ class TurboDynamicCache(Cache):
         if USE_COMPRESSED_STORE and engine.store.num_tokens > 0:
             flat = engine.store.get_flat_cache()
             # Keys: TurboQuant inverse. Values: group-dequant. Both -> (Hkv, T, D).
-            store_k = engine.store.quantizer.dequantize(flat.prod_q)
+            if USE_QJL:
+                store_k = engine.store.quantizer.dequantize(flat.prod_q)
+            else:
+                # MSE-only key reconstruction: the QJL residual stage is an
+                # unbiased *inner-product* estimator and injects variance into
+                # point-wise reconstruction (measured: it raises rel-err / lowers
+                # cos at every bit width). Skipping it keeps keys closer.
+                from src.turboquant_v1.quantize import MSEQuantized
+                pq = flat.prod_q
+                mse = MSEQuantized(indices=pq.mse_indices, norms=pq.norms, bits=pq.mse_bits)
+                store_k = engine.store.quantizer.mse_quantizer.dequantize(mse)
             store_v = dequantize_V(flat.value_q, group_size=engine.store.value_group_size)
             # -> (T, Hkv, D) to match the ring layout, in the cache's dtype.
             store_k = store_k.permute(1, 0, 2).to(ring_k.dtype)
@@ -324,7 +346,7 @@ if __name__ == "__main__":
         outputs = model.generate(
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
-            min_new_tokens=MIN_NEW_TOKENS,   # force ring overflow so the store fills
+            # min_new_tokens=MIN_NEW_TOKENS,   # force ring overflow so the store fills
             do_sample=False,          # greedy decoding
             use_cache=True,
             past_key_values=turbo_cache,   # our custom cache

@@ -303,14 +303,19 @@ With `USE_COMPRESSED_STORE=True`, output was coherent for ~130 tokens then colla
 `to to to...` / `AI AI AI...`.
 
 **Why it happened (root cause)**
-Two layers:
-1. **Bit budget**: keys at 3 bits have large reconstruction error.
-2. **Wrong compute path (the real one)**: `get_full_kv` does `dequantize -> dense SDPA`.
-   TurboQuant is *designed* to score `⟨q, k⟩` directly from the quantized keys via an
-   unbiased QJL estimator (`TurboQuant.attention_score(query, quantized_key)`). The
-   estimator keeps *inner products* accurate even when point-wise key reconstruction is
-   poor. Dequantizing first throws that away and feeds raw quant noise into attention, so
-   the 0.43 key error hits the scores directly and compounds over 36 layers.
+Pure **bit budget / key-quantizer fidelity** — *not* an integration bug (proven below by a
+clean K8/V8 run). Keys at 3 bits have ~0.43 relative reconstruction error, which corrupts
+attention scores; the error compounds across 36 layers and hundreds of positions once
+attention leans on the compressed tail.
+
+A hypothesis recorded **because it was wrong**: "route the compressed segment through
+TurboQuant's `attention_score(query, quantized_key)` estimator instead of
+dequantize→matmul." Measuring it: the estimator gives **identical** scores to
+dequantize→matmul (both 0.437 rel-err on the same data). They are algebraically equivalent
+for a fixed QJL projection S — `q @ (k_mse + x_qjl).T == (q @ k_mse.T) + (q @ S.T) @
+signs.T * scale`. So the estimator skips the dequantize step but does **not** improve
+accuracy (its benefit is variance reduction in expectation over random S, not a per-call
+gain). The estimator was a dead end.
 
 **How it was found** (the decisive sequence)
 1. Round-trip identity test, isolated from the model:
@@ -321,29 +326,29 @@ rel = (k - kr).norm() / k.norm()                    # relative error
 ```
    K3 key rel-err = 0.43, value 0.39 — high.
 2. Precision sweep: K3V2 -> K4V4 -> K8V8 gave key 0.43 -> 0.23 -> 0.02. **Monotone, and
-   K8 ≈ exact → the quantizer is correct; it's a budget/usage issue, not a code bug.**
-3. Tried the obvious fix (K4/V4) and it *still* degenerated (3.02x). A failed fix is
-   information: bits alone aren't the story.
-4. `grep` for the store's methods surfaced `attention_score` / `attention_scores` — the
-   intended fused path my wiring bypassed. That is the root cause.
+   K8 ≈ exact → the quantizer is correct; it's a budget issue, not a code bug.**
+3. Tested the estimator premise numerically: `attention_score` vs dequantize→matmul scores
+   were **identical (0.437 == 0.437)**. Killed that fix before implementing it.
+4. **Generation sweep (decisive):** K3/V2 garbage, K4/V4 degrades, **K8/V8 clean**. A clean
+   high-bit run proves there is no integration bug — the loss is entirely the quantizer's.
+   K8/V4 is the working sweet spot: clean output, ~2.25x on the compressed segment.
 
-**The fix (open)**
-Route the compressed segment through the estimator instead of dequantize→dense:
-```
-ring scores  = q @ ring_k.T                                  # exact recent tokens
-store scores = store.quantizer.attention_score(q, flat.prod_q)  # unbiased, quantized keys
-logits = concat([store scores, ring scores]); softmax once
-attend over [dequantize_V(store values) ⊕ ring values]
-```
-This is a rewrite of the patched attention (not `get_full_kv`). Raising bits is a stopgap;
-the estimator path is the correct TurboQuant integration.
+**The fix (applied) + the real algorithmic fix (future)**
+- Applied: `KEY_BITS=8, VALUE_BITS=4` -> clean generation, ~2.25x segment. Tradeoff table
+  in the script header. (K3/V2 5.12x garbage; K4/V4 3.12x degrades; K8/V4 2.25x clean;
+  K8/V8 1.75x clean.)
+- Why keys need 8 bits: the quantizer treats keys per-vector with one scalar codebook and
+  no outlier handling. Transformer keys have a few large-magnitude *channels*; quantizing
+  uniformly across them wastes the budget. The KIVI result is to quantize the **key cache
+  per-channel** (values per-token). Per-channel key quantization is the real path to
+  low-bit keys with good quality — a quantizer change, not a wiring change.
 
 **Lesson**
-Use the identity test + precision sweep to split bug from budget fast. When a plausible fix
-doesn't help, the mental model is wrong — re-read the algorithm's intended interface; a
-shortcut implementation often bypasses the exact mechanism that makes the method work. And
-read the *shape* of the failure: "coherent then collapses, right when compressed history
-takes over" pointed straight at the compressed-key compute path.
+Identity test + precision sweep splits bug from budget. Then **verify a proposed fix's
+premise numerically before building it** — the estimator *looked* like the fix but is the
+same math. A clean high-bit generation run is what definitively rules out an integration
+bug. The failure's shape ("coherent then collapses when the compressed tail takes over")
+pointed straight at compressed-key fidelity.
 
 ---
 
@@ -359,5 +364,5 @@ takes over" pointed straight at the compressed-key compute path.
 | 6 | decode still wrong | `is_causal=True` at q_len=1 | `is_causal = q_len==kv_len>1` |
 | 7 | "is it really TQ?" | `get_full_kv` read ring only | wire store decompress + A/B toggle |
 | 8 | report `1.00x` | ring never overflowed | `MIN_NEW_TOKENS` to force overflow |
-| 9 | TQ-in-loop degenerates | dequantize→dense bypasses estimator (+ low bits) | route via `attention_score` (open) |
+| 9 | TQ-in-loop degenerates | low-bit key fidelity (estimator == dequant; not a bug) | `KEY_BITS=8/VALUE_BITS=4` clean; per-channel keys = real fix |
 ```
