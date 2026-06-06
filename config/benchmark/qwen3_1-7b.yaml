@@ -1,0 +1,133 @@
+# Benchmark: Qwen3-1.7B — FP16 baseline vs a TurboQuant-KV-cache variant.
+# Demonstrates the new per-model knobs:
+#   model_class : which transformers Auto* class to load with (auto|causal_lm|
+#                 image_text_to_text|seq2seq_lm|vision2seq).
+#   turboquant  : enable the TurboQuant KV cache (HF runtime, single-sequence).
+run_name: qwen3-1.7b-sweep
+output_root: ./results
+runtimes: ["hf"]    # add "vllm" once a vLLM env is available
+
+metrics:
+  # quality_llm: ["ppl", "mmlu_tiny", "gsm8k", "ceval", "aime", "humaneval"]
+  quality_llm: ["ppl", "mmlu_tiny"]
+  quality_ocr: []
+  perf:        ["ttft", "tpot", "throughput", "max_context"]
+  memory:      ["disk", "vram", "load_time"]
+
+tracking:
+  enabled: ["wandb"]              # logs each model@runtime as its own W&B run
+  wandb_project: triplequant-bench
+  # set WANDB_API_KEY (or `wandb login`) to activate; otherwise auto-skipped
+
+datasets:
+  ppl_dataset: wikitext          # NOTE: ppl is HF-only (vLLM hides logits) → auto-skipped on vllm
+  ppl_subset:  wikitext-2-raw-v1
+  gsm8k_num_samples: 200
+  gsm8k_max_new_tokens: 2048     # Qwen3-Thinking: long <think> chains; 512 truncates before the answer
+  aime_num_samples: 30
+  aime_max_new_tokens: 4096      # competition math reasoning is long
+  ceval_num_q_per_subject: 20
+  humaneval_num_samples: 20
+  humaneval_max_new_tokens: 1536 # leave room for reasoning before the code
+  humaneval_execute: false       # set true ONLY in a trusted/sandboxed env (runs model-generated code)
+
+latency:
+  batch_sizes:  [1, 4, 8]
+  output_lens:  [128, 512, 1024, 4096]
+  num_requests: 20
+  warmup_requests: 3
+
+models:
+  - name: qwen3-1.7b-fp16-baseline
+    path: Qwen/Qwen3-1.7B
+    is_local: false
+    model_type: llm
+    model_class: causal_lm        # explicit; "auto" would also pick causal_lm
+    dtype: bfloat16
+
+  - name: qwen3-1.7b-turboquant-k3v2
+    path: Qwen/Qwen3-1.7B
+    is_local: false
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    turboquant:
+      enabled: true
+      ring_capacity: 256
+      key_bits: 3
+      value_bits: 2
+      use_qjl: false              # MSE-only keys (QJL hurts reconstruction)
+      use_compressed_store: true  # TQ actually in the decode loop
+
+  # - name: qwen3-4b-awq-w4a16
+  #   path: ./outputs/qwen3-4b-thinking/awq-w4a16/Qwen3-4B-Thinking-2507-llm_compressor-awq-W4A16
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen3-4b-gptq-w4a16
+  #   path: ./outputs/qwen3-4b-thinking/gptq-w4a16/Qwen3-4B-Thinking-2507-llm_compressor-gptq-W4A16
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen3-4b-gptq-w8a8
+  #   path: ./outputs/qwen3-4b-thinking/gptq-w8a8/Qwen3-4B-Thinking-2507-llm_compressor-gptq-W8A8
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen3-4b-ptq-w8a8-sq
+  #   path: ./outputs/qwen3-4b-thinking/ptq-w8a8-smoothquant/Qwen3-4B-Thinking-2507-llm_compressor-ptq-W8A8
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen3-4b-ptq-fp8
+  #   path: ./outputs/qwen3-4b-thinking/ptq-fp8/Qwen3-4B-Thinking-2507-llm_compressor-ptq-FP8
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen3-4b-ptq-fp8-dyn
+  #   path: ./outputs/qwen3-4b-thinking/ptq-fp8-dynamic/Qwen3-4B-Thinking-2507-llm_compressor-ptq-FP8_DYNAMIC
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+
+  # - name: qwen3-4b-ptq-nvfp4
+  #   path: ./outputs/qwen3-4b-thinking/ptq-nvfp4/Qwen3-4B-Thinking-2507-llm_compressor-ptq-NVFP4
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: llm_compressor
+  #   vllm_quantization: compressed-tensors
+  #   skip_on: ["sm_86"]        # NVFP4 needs Blackwell
+
+  # - name: qwen3-4b-modelopt-fp8
+  #   path: ./outputs/qwen3-4b-thinking/modelopt-fp8/Qwen3-4B-Thinking-2507-modelopt-ptq-FP8
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: modelopt
+  #   vllm_quantization: modelopt
+
+  # - name: qwen3-4b-modelopt-nvfp4
+  #   path: ./outputs/qwen3-4b-thinking/modelopt-nvfp4-awq/Qwen3-4B-Thinking-2507-modelopt-awq-NVFP4
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: modelopt
+  #   vllm_quantization: modelopt_fp4
+  #   skip_on: ["sm_86"]        # NVFP4 needs Blackwell
+
+  # - name: qwen3-4b-modelopt-mxfp4
+  #   path: ./outputs/qwen3-4b-thinking/modelopt-mxfp4/Qwen3-4B-Thinking-2507-modelopt-ptq-MXFP4
+  #   is_local: true
+  #   model_type: llm
+  #   backend_hint: modelopt
+  #   vllm_quantization: modelopt
+  #   skip_on: ["sm_86"]        # MXFP4 needs Blackwell

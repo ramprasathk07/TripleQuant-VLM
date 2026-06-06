@@ -47,13 +47,11 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-from .base import RuntimeBase
+from ..base import RuntimeBase
 
 
-# ════════════════════════════════════════════════════════════════════════════════
+
 # Internal helpers
-# ════════════════════════════════════════════════════════════════════════════════
-
 def _require_transformers() -> None:
     if not TRANSFORMERS_AVAILABLE:
         raise ImportError(
@@ -214,9 +212,7 @@ def _model_load_kwargs(quant_cfg, dtype, device_map, trust_rc: bool) -> dict:
         kw["quantization_config"] = quant_cfg
     return kw
 
-
 _QC_REPR_PATCHED = False
-
 
 def _patch_quantization_config_repr() -> None:
     """Work around a transformers bug that crashes loading compressed-tensors VLMs.
@@ -256,10 +252,8 @@ def _patch_quantization_config_repr() -> None:
     _QC_REPR_PATCHED = True
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# HFRuntime
-# ════════════════════════════════════════════════════════════════════════════════
 
+# HFRuntime
 class HFRuntime(RuntimeBase):
     """HuggingFace Transformers backend for LLM and VLM inference.
 
@@ -293,9 +287,22 @@ class HFRuntime(RuntimeBase):
 
         self._is_vlm:    bool          = False
         self._model_id:  str           = ""
+        self._tq_cfg                   = None   # CacheConfig when TurboQuant enabled
         self._device:    torch.device  = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+
+    def _maybe_tq_cache(self, batch_size: int):
+        """Build a fresh TurboQuant cache for a single-sequence generate, or None.
+
+        TurboQuant's cache assumes batch size 1 (it indexes ``key_states[0]``), so
+        batched calls fall back to the model's default cache. A new cache is built
+        per call because it accumulates state across the generation.
+        """
+        if self._tq_cfg is None or batch_size != 1:
+            return None
+        from .cache import TurboQuantCache
+        return TurboQuantCache(self.model.config, self._tq_cfg)
 
     def load(self, entry: "BenchmarkModelEntry") -> None:
         """Load model and tokenizer/processor from Hugging Face.
@@ -327,27 +334,81 @@ class HFRuntime(RuntimeBase):
         dtype        = _resolve_dtype(getattr(entry, "dtype", None))
         device_map   = getattr(entry, "device_map",        "auto")
         trust_rc     = getattr(entry, "trust_remote_code", False)
-        self._is_vlm = entry.is_vlm
+
+        # Resolve which loader to use. Explicit `model_class` wins; "auto" falls back
+        # to the model_type heuristic (vlm -> VLM loader, else causal-LM).
+        model_class  = getattr(entry, "model_class", "auto")
+        route        = self._resolve_load_route(model_class, entry.is_vlm)
+        self._is_vlm = route == "vlm"
 
         # Reset VRAM peak counter before loading
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
         logger.info(
-            f"[HFRuntime] Loading '{model_id}' | "
-            f"vlm={self._is_vlm} | quant={getattr(entry, 'hf_quantization', None)} | "
+            f"[HFRuntime] Loading '{model_id}' | route={route} | model_class={model_class} | "
+            f"quant={getattr(entry, 'hf_quantization', None)} | "
             f"dtype={dtype} | device_map={device_map}"
         )
 
-        if self._is_vlm:
+        if route == "vlm":
             self._load_vlm(model_id, quant_cfg, dtype, device_map, trust_rc)
         else:
-            self._load_causal_lm(model_id, quant_cfg, dtype, device_map, trust_rc)
+            self._load_causal_lm(model_id, quant_cfg, dtype, device_map, trust_rc,
+                                 seq2seq=(route == "seq2seq"))
 
         self._sanitize_generation_config()
+        self._maybe_enable_turboquant(entry)
 
         logger.info(f"[HFRuntime] '{model_id}' ready. "
                     f"Peak VRAM so far: {self.peak_vram_mb():.1f} MB")
+
+    @staticmethod
+    def _resolve_load_route(model_class: str, is_vlm: bool) -> str:
+        """Map a model_class (+ is_vlm heuristic) to a loader route.
+
+        Returns one of "vlm", "lm", "seq2seq".
+        """
+        explicit = {
+            "causal_lm":          "lm",
+            "image_text_to_text": "vlm",
+            "vision2seq":         "vlm",
+            "seq2seq_lm":         "seq2seq",
+        }
+        if model_class in explicit:
+            return explicit[model_class]
+        return "vlm" if is_vlm else "lm"     # model_class == "auto"
+
+    def _maybe_enable_turboquant(self, entry: "BenchmarkModelEntry") -> None:
+        """Patch attention + arm a TurboQuant cache when enabled for this entry."""
+        tq = getattr(entry, "turboquant", None)
+        if tq is None or not getattr(tq, "enabled", False):
+            return
+        if self._is_vlm:
+            logger.warning("[HFRuntime] TurboQuant on VLMs is not supported yet — "
+                           "skipping for '%s'.", self._model_id)
+            return
+        from .config import CacheConfig
+        from .patcher import patch_model_attention
+        self._tq_cfg = CacheConfig(
+            ring_capacity=tq.ring_capacity,
+            key_bits=tq.key_bits,
+            value_bits=tq.value_bits,
+            use_qjl=tq.use_qjl,
+            use_compressed_store=tq.use_compressed_store,
+            device=str(self._device),
+            dtype=(getattr(self.model, "dtype", None) and str(self.model.dtype).split(".")[-1]) or "bfloat16",
+        )
+        n_patched = patch_model_attention(self.model)
+        if n_patched == 0:
+            logger.warning("[HFRuntime] TurboQuant: no attention modules matched the "
+                           "duck-type — TQ will not engage. Disabling.")
+            self._tq_cfg = None
+            return
+        logger.info("[HFRuntime] TurboQuant enabled: %d attn layers patched | "
+                    "ring=%d K%d/V%d use_qjl=%s store=%s",
+                    n_patched, tq.ring_capacity, tq.key_bits, tq.value_bits,
+                    tq.use_qjl, tq.use_compressed_store)
 
     def _sanitize_generation_config(self) -> None:
         """Drop sampling-only fields baked into the checkpoint's generation_config.
@@ -373,8 +434,14 @@ class HFRuntime(RuntimeBase):
         dtype:      torch.dtype,
         device_map: str,
         trust_rc:   bool,
+        seq2seq:    bool = False,
     ) -> None:
-        """Loads a standard CausalLM model and its tokenizer."""
+        """Loads a decoder-only (or, when ``seq2seq``, encoder-decoder) LM + tokenizer."""
+        if seq2seq:
+            from transformers import AutoModelForSeq2SeqLM
+            model_cls = AutoModelForSeq2SeqLM
+        else:
+            model_cls = AutoModelForCausalLM
 
         try:
             logger.info(f"[HFRuntime] trying to load model normally...")
@@ -389,9 +456,10 @@ class HFRuntime(RuntimeBase):
                 self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
             # Decoder-only models require LEFT padding for correct batched generation;
             # right padding corrupts outputs and breaks prompt-length slicing.
-            self.tokenizer.padding_side = "left"
+            # Encoder-decoder models pad on the right (encoder side).
+            self.tokenizer.padding_side = "right" if seq2seq else "left"
 
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.model = model_cls.from_pretrained(
                 model_id, **_model_load_kwargs(quant_cfg, dtype, device_map, trust_rc),
             )
             self.model.eval()
@@ -410,14 +478,9 @@ class HFRuntime(RuntimeBase):
                         "compressed-tensors is required for pack-quantized models.\n"
                         "Install: pip install llmcompressor"
                     )
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id, torch_dtype=dtype, device_map="auto"
-                )
-            else:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id, torch_dtype=dtype, device_map="auto"
-                )
-
+            self.model = model_cls.from_pretrained(
+                model_id, torch_dtype=dtype, device_map="auto"
+            )
             self.model.eval()
 
     def _load_vlm(
@@ -486,6 +549,7 @@ class HFRuntime(RuntimeBase):
 
         self._model_id = ""
         self._is_vlm   = False
+        self._tq_cfg   = None
 
         gc.collect()
         if torch.cuda.is_available():
@@ -494,9 +558,9 @@ class HFRuntime(RuntimeBase):
 
         logger.info("[HFRuntime] Unload complete.")
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Text generation
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def generate(
         self,
@@ -533,6 +597,12 @@ class HFRuntime(RuntimeBase):
         )
         if do_sample:
             gen_kwargs["temperature"] = temperature
+
+        # Route generation through the TurboQuant cache when enabled (single-seq only).
+        tq_cache = self._maybe_tq_cache(len(prompts))
+        if tq_cache is not None:
+            gen_kwargs["past_key_values"] = tq_cache
+            gen_kwargs["use_cache"] = True
 
         with torch.no_grad():
             output_ids = self.model.generate(**inputs, **gen_kwargs)
@@ -619,10 +689,8 @@ class HFRuntime(RuntimeBase):
 
         return out.logits   # (1, seq_len, vocab_size)
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # VLM generation
-    # ════════════════════════════════════════════════════════════════════════════
-
     def generate_vlm(
         self,
         image,
@@ -710,10 +778,8 @@ class HFRuntime(RuntimeBase):
             output_ids[0][prompt_len:], skip_special_tokens=True
         )
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Latency profiling
-    # ════════════════════════════════════════════════════════════════════════════
-
     def measure_ttft_tpot(self, prompt: str, n: int = 100) -> dict:
         """
         Measures Time-To-First-Token (TTFT) and Time-Per-Output-Token (TPOT)
@@ -754,11 +820,14 @@ class HFRuntime(RuntimeBase):
             _sync_cuda()
             t0 = time.perf_counter()
             with torch.no_grad():
+                _ttft_extra = {"past_key_values": self._maybe_tq_cache(1), "use_cache": True} \
+                    if self._tq_cfg is not None else {}
                 _ = self.model.generate(
                     **inputs,
                     max_new_tokens = 1,
                     do_sample      = False,
                     pad_token_id   = self.tokenizer.pad_token_id,
+                    **_ttft_extra,
                 )
             _sync_cuda()
             ttft_ms = (time.perf_counter() - t0) * 1_000
@@ -767,6 +836,8 @@ class HFRuntime(RuntimeBase):
             _sync_cuda()
             t1 = time.perf_counter()
             with torch.no_grad():
+                _tpot_extra = {"past_key_values": self._maybe_tq_cache(1), "use_cache": True} \
+                    if self._tq_cfg is not None else {}
                 out = self.model.generate(
                     **inputs,
                     max_new_tokens          = OUTPUT_TOKENS,
@@ -775,6 +846,7 @@ class HFRuntime(RuntimeBase):
                     return_dict_in_generate = True,
                     output_scores           = True,
                     pad_token_id            = self.tokenizer.pad_token_id,
+                    **_tpot_extra,
                 )
             _sync_cuda()
             total_ms    = (time.perf_counter() - t1) * 1_000
@@ -809,9 +881,9 @@ class HFRuntime(RuntimeBase):
             "n_trials":     n,
         }
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Throughput profiling
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def measure_throughput(
         self,
@@ -865,12 +937,16 @@ class HFRuntime(RuntimeBase):
                     _sync_cuda()
                     t0 = time.perf_counter()
                     with torch.no_grad():
+                        # TurboQuant cache only at bs=1 (batched falls back to default).
+                        _tp_extra = {"past_key_values": self._maybe_tq_cache(bs), "use_cache": True} \
+                            if self._tq_cfg is not None and bs == 1 else {}
                         self.model.generate(
                             **inputs,
                             max_new_tokens = output_len,
                             min_new_tokens = output_len,   # force full length (no early EOS) for stable tok/s
                             do_sample      = False,
                             pad_token_id   = self.tokenizer.pad_token_id,
+                            **_tp_extra,
                         )
                     _sync_cuda()
                     latencies_ms.append((time.perf_counter() - t0) * 1_000)
@@ -915,10 +991,8 @@ class HFRuntime(RuntimeBase):
 
         return results
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Memory
-    # ════════════════════════════════════════════════════════════════════════════
-
     def peak_vram_mb(self) -> float:
         """
         Returns peak VRAM allocated (in MB) since last reset.
@@ -937,10 +1011,8 @@ class HFRuntime(RuntimeBase):
             return 0.0
         return torch.cuda.memory_allocated() / (1024 ** 2)
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Max context probe
-    # ════════════════════════════════════════════════════════════════════════════
-
     def _model_max_positions(self) -> Optional[int]:
         """Best-effort read of the model's max position embeddings (handles VLM text_config)."""
         cfg = getattr(self.model, "config", None)
@@ -1047,10 +1119,7 @@ class HFRuntime(RuntimeBase):
             "capped_by":           "oom",
         }
 
-    # ════════════════════════════════════════════════════════════════════════════
     # Extras: score_choices (used by eval_mmlu_tiny)
-    # ════════════════════════════════════════════════════════════════════════════
-
     def score_choices(
         self,
         prompt:  str,
@@ -1089,22 +1158,16 @@ class HFRuntime(RuntimeBase):
             scores[label] = last_log_probs[token_ids[0]].item()
 
         return scores
-
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Internal guards
-    # ════════════════════════════════════════════════════════════════════════════
-
     def _check_loaded(self) -> None:
         """Raises RuntimeError if load() has not been called yet."""
         if self.model is None or self.tokenizer is None:
             raise RuntimeError(
                 "HFRuntime: model is not loaded. Call load(entry) first."
             )
-
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Dunder helpers
-    # ════════════════════════════════════════════════════════════════════════════
-
     def __repr__(self) -> str:
         status = f"loaded='{self._model_id}'" if self.model else "unloaded"
         return f"HFRuntime({status}, device={self._device}, vlm={self._is_vlm})"

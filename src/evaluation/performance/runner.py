@@ -31,9 +31,9 @@ except Exception:  # pragma: no cover - torch always present in real runs
 _DEFAULT_PERF_PROMPT = "Explain the theory of relativity in simple terms, step by step."
 
 
-# ════════════════════════════════════════════════════════════════════════════
+
 # GPU memory + OOM helpers
-# ════════════════════════════════════════════════════════════════════════════
+
 
 def clear_gpu_memory() -> None:
     """Release cached allocator blocks and run a GC pass. No-op without CUDA."""
@@ -74,10 +74,8 @@ def oom_safe(label: str, fn: Callable[[], dict | list]) -> dict | list:
         return {"error": traceback.format_exc()}
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Orchestration
-# ════════════════════════════════════════════════════════════════════════════
 
+# Orchestration
 def run_perf_metrics(runtime, config, perf_prompt: str = _DEFAULT_PERF_PROMPT) -> dict:
     """Run all enabled perf metrics for *runtime*, each guarded against OOM.
 

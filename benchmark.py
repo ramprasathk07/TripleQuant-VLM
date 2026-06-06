@@ -356,6 +356,107 @@ def _run_model_on_runtime(
     return results
 
 
+# ── Weights & Biases tracking ────────────────────────────────────────────────
+def _flatten_metrics(metrics: dict, prefix: str = "") -> dict:
+    """Flatten a nested benchmark metrics dict into scalar `key -> number` pairs.
+
+    - dicts recurse with a "/"-joined prefix;
+    - a throughput list (items with `batch_size`) expands to `.../bs{n}/...`;
+    - booleans become 0/1; non-numeric values (strings, None, error/oom markers)
+      are dropped so only loggable scalars remain.
+    """
+    out: dict = {}
+    for key, val in metrics.items():
+        if key in ("per_sample", "error", "detail"):
+            continue
+        full = f"{prefix}{key}"
+        if isinstance(val, bool):
+            out[full] = int(val)
+        elif isinstance(val, (int, float)):
+            out[full] = val
+        elif isinstance(val, dict):
+            out.update(_flatten_metrics(val, prefix=f"{full}/"))
+        elif isinstance(val, list) and val and isinstance(val[0], dict):
+            for item in val:
+                tag = f"bs{item['batch_size']}" if "batch_size" in item else None
+                if tag is None:
+                    continue
+                out.update(_flatten_metrics(
+                    {k: v for k, v in item.items() if k != "batch_size"},
+                    prefix=f"{full}/{tag}/",
+                ))
+    return out
+
+
+def _init_wandb(config: BenchmarkConfig):
+    """Build a WandBLogger if W&B tracking is enabled and importable, else None.
+
+    Single project (config.tracking.wandb_project); each (model, runtime) becomes
+    its own run. Never raises — tracking failures must not abort the benchmark.
+    """
+    import os
+    if "wandb" not in config.tracking.enabled:
+        return None
+    # Only activate when credentials exist, so a no-creds run never blocks on an
+    # interactive wandb login prompt. Honour WANDB_API_KEY (or an existing login).
+    has_key = bool(os.environ.get(config.tracking.wandb_api_key_env))
+    if not has_key:
+        try:
+            import wandb
+            has_key = wandb.api.api_key is not None
+        except Exception:
+            has_key = False
+    if not has_key:
+        logger.warning("W&B enabled but no API key (%s) and not logged in — "
+                       "skipping tracking. `wandb login` or set the env var to enable.",
+                       config.tracking.wandb_api_key_env)
+        return None
+    try:
+        from src.tracking.wandb_connector import WandBLogger
+        return WandBLogger(
+            project_name=config.tracking.wandb_project,
+            entity=config.tracking.wandb_entity,
+        )
+    except Exception as exc:
+        logger.warning("W&B tracking disabled (init failed): %s", exc)
+        return None
+
+
+def _log_record_to_wandb(tracker, record: dict, entry: BenchmarkModelEntry,
+                         runtime_name: str, config: BenchmarkConfig, arch: str) -> None:
+    """Log one (model, runtime) record as a dedicated W&B run. Best-effort."""
+    if tracker is None:
+        return
+    run_name = f"{entry.name} @ {runtime_name}"
+    if entry.turboquant_enabled:
+        run_name += " +tq"
+    try:
+        run_cfg = {
+            "model_name": entry.name,
+            "model_path": entry.path,
+            "model_type": entry.model_type,
+            "model_class": entry.model_class,
+            "runtime": runtime_name,
+            "dtype": entry.dtype,
+            "hf_quantization": entry.hf_quantization,
+            "vllm_quantization": entry.vllm_quantization,
+            "turboquant": entry.turboquant.model_dump() if entry.turboquant else None,
+            "gpu_arch": arch,
+            "benchmark_run": config.run_name,
+            "status": record.get("status"),
+        }
+        tracker.start_run(run_name=run_name, config=run_cfg)
+        flat = _flatten_metrics(record.get("metrics", {}))
+        if flat:
+            tracker.log_metrics(flat)
+            # Also surface every scalar in the run summary for the comparison table.
+            if tracker._current_run is not None:
+                tracker._current_run.summary.update(flat)
+        tracker.finish_current_run()
+    except Exception as exc:
+        logger.warning("W&B logging failed for '%s': %s", run_name, exc)
+
+
 # Summary
 def _build_comparison_summary(all_results: dict) -> dict:
     """Reshape flat benchmark results into a comparison table.
@@ -513,6 +614,9 @@ def main() -> None:
     all_results: dict[str, dict] = {}
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     arch = _detect_arch()
+    tracker = _init_wandb(config)
+    if tracker is not None:
+        logger.info("W&B tracking on → project '%s'", config.tracking.wandb_project)
 
     for entry in config.models:
         if arch and arch in entry.skip_on:
@@ -573,6 +677,8 @@ def main() -> None:
                 json.dump(record, f, indent=2, default=str)
             logger.info("💾 Saved → %s", out_path)
 
+            _log_record_to_wandb(tracker, record, entry, runtime_name, config, arch)
+
     summary = _build_comparison_summary(all_results)
     summary_path = results_dir / f"comparison_summary_{run_ts}.json"
     with summary_path.open("w", encoding="utf-8") as f:
@@ -582,6 +688,12 @@ def main() -> None:
     logger.info("✅ Benchmark complete. Summary → %s", summary_path)
     logger.info("=" * 60)
     _print_summary_table(summary)
+
+    if tracker is not None:
+        try:
+            tracker.__exit__(None, None, None)   # finish run + NVML shutdown
+        except Exception:
+            pass
 
 
 def _detect_arch() -> str:

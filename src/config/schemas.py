@@ -40,6 +40,12 @@ QuantSchemeLiteral = Literal[
 MethodLiteral = Literal["awq", "gptq", "ptq", "turboquant"]
 ModalityLiteral = Literal["auto", "text", "vision", "vision_text", "audio"]
 ModelTypeLiteral = Literal["llm", "vlm", "moe", "custom"]
+# Which transformers Auto* class to load a benchmark model with. "auto" picks
+# from model_type (vlm -> image_text_to_text, else causal_lm); the explicit values
+# force a class for architectures the heuristic misses.
+ModelClassLiteral = Literal[
+    "auto", "causal_lm", "image_text_to_text", "seq2seq_lm", "vision2seq",
+]
 
 # New type for observers
 ObserverLiteral = Literal["mse", "minmax", "maxabs", "percentile"]
@@ -423,6 +429,33 @@ class LatencyConfig(BaseModel):
     num_requests: int = 100
     warmup_requests: int = 5
 
+class TurboQuantRuntimeConfig(BaseModel):
+    """Per-model TurboQuant KV-cache settings for benchmarking.
+
+    When ``enabled``, the HF runtime patches attention to read from a TurboQuant
+    cache (ring buffer of recent exact tokens + bit-compressed overflow store), so
+    generation runs over the compressed KV. Single-sequence only (the cache assumes
+    batch size 1); batched throughput falls back to the normal cache.
+
+    Attributes:
+        enabled: Turn TurboQuant on for this model entry.
+        ring_capacity: Most-recent tokens kept exact (bf16) before compression.
+        key_bits / value_bits: Bit budget for compressed keys / values.
+        use_qjl: Keep the QJL residual on key reconstruction (default False — it
+                 adds variance and hurts generation; MSE-only is better).
+        use_compressed_store: Read the compressed overflow in attention (True = TQ
+                 in the decode loop) vs ring-only sliding window (False).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    ring_capacity: int = 256
+    key_bits: int = 3
+    value_bits: int = 2
+    use_qjl: bool = False
+    use_compressed_store: bool = True
+
+
 class BenchmarkModelEntry(BaseModel):
     """Single model entry in a benchmark comparison run.
 
@@ -460,11 +493,20 @@ class BenchmarkModelEntry(BaseModel):
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1             # vLLM multi-GPU
     hf_quantization: Optional[str] = None     # HF on-the-fly BnB: None | 'int8' | 'int4' | 'nf4'
+    model_class: ModelClassLiteral = "auto"   # which transformers Auto* class to load with
+
+    # ── TurboQuant KV-cache (HF runtime only) ──
+    turboquant: Optional[TurboQuantRuntimeConfig] = None
 
     @property
     def is_vlm(self) -> bool:
         """True if this entry describes a vision-language model."""
-        return self.model_type == "vlm"
+        return self.model_type == "vlm" or self.model_class in ("image_text_to_text", "vision2seq")
+
+    @property
+    def turboquant_enabled(self) -> bool:
+        """True if TurboQuant is configured and enabled for this entry."""
+        return self.turboquant is not None and self.turboquant.enabled
 
 class TrackingConfig(BaseModel):
     """Multi-backend experiment tracking configuration.

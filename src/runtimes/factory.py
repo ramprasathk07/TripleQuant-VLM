@@ -10,8 +10,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from .base      import RuntimeBase
-from .hf_runtime   import HFRuntime
-from .vllm_runtime import VLLMRuntime
+from .hf.hf_runtime   import HFRuntime
+from .vllm.vllm_runtime import VLLMRuntime
 
 if TYPE_CHECKING:
     from src.config.schemas import BenchmarkModelEntry

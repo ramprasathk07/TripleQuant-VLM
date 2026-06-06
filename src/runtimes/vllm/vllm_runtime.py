@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from .base import RuntimeBase
+from ..base import RuntimeBase
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +39,7 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-
-# ════════════════════════════════════════════════════════════════════════════════
 # Internal helpers
-# ════════════════════════════════════════════════════════════════════════════════
-
 def _require_vllm() -> None:
     if not VLLM_AVAILABLE:
         raise ImportError(
@@ -51,11 +47,9 @@ def _require_vllm() -> None:
             "Install it with: pip install vllm"
         )
 
-
 def _sync_cuda() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-
 
 def _percentile(sorted_data: list[float], p: float) -> float:
     """Return the p-th percentile from a sorted list of values.
@@ -69,7 +63,6 @@ def _percentile(sorted_data: list[float], p: float) -> float:
     """
     idx = max(0, min(int(len(sorted_data) * p), len(sorted_data) - 1))
     return sorted_data[idx]
-
 
 def _timing_stats(times_ms: list[float]) -> dict:
     """Compute timing statistics (mean, percentiles, min/max).
@@ -89,7 +82,6 @@ def _timing_stats(times_ms: list[float]) -> dict:
         "min":  s[0],
         "max":  s[-1],
     }
-
 
 def _resolve_vllm_dtype(dtype_str: Optional[str]) -> str:
     """Map dtype string to vLLM-compatible dtype string.
@@ -121,7 +113,6 @@ def _resolve_vllm_dtype(dtype_str: Optional[str]) -> str:
             f"Choose from: {[k for k in _map if k is not None]}"
         )
     return _map[key]
-
 
 def _resolve_vllm_quantization(quant: Optional[str]) -> Optional[str]:
     """Map quantization string to vLLM-accepted quantization type.
@@ -162,10 +153,8 @@ def _resolve_vllm_quantization(quant: Optional[str]) -> Optional[str]:
     return q
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# VLLMRuntime
-# ════════════════════════════════════════════════════════════════════════════════
 
+# VLLMRuntime
 class VLLMRuntime(RuntimeBase):
     """vLLM backend for high-throughput text-only LLM inference.
 
@@ -288,10 +277,8 @@ class VLLMRuntime(RuntimeBase):
 
         logger.info("[VLLMRuntime] Unload complete.")
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Text generation
-    # ════════════════════════════════════════════════════════════════════════════
-
     def generate(
         self,
         prompts:        list[str],
@@ -353,10 +340,8 @@ class VLLMRuntime(RuntimeBase):
             "Switch to HFRuntime for PPL / KL-divergence evaluation."
         )
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # VLM generation
-    # ════════════════════════════════════════════════════════════════════════════
-
     def generate_vlm(
         self,
         image,
@@ -374,10 +359,8 @@ class VLLMRuntime(RuntimeBase):
             "Use HFRuntime with entry.is_vlm=True for VLM inference."
         )
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Latency profiling
-    # ════════════════════════════════════════════════════════════════════════════
-
     def measure_ttft_tpot(self, prompt: str, n: int = 100) -> dict:
         """
         Measures Time-To-First-Token (TTFT) and Time-Per-Output-Token (TPOT)
@@ -458,9 +441,9 @@ class VLLMRuntime(RuntimeBase):
             "n_trials":     n,
         }
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Throughput profiling
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def measure_throughput(
         self,
@@ -562,9 +545,9 @@ class VLLMRuntime(RuntimeBase):
 
         return results
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Memory
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def peak_vram_mb(self) -> float:
         """
@@ -584,9 +567,9 @@ class VLLMRuntime(RuntimeBase):
             return 0.0
         return torch.cuda.memory_allocated() / (1024 ** 2)
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Max context  (read from engine config — vLLM pre-sizes the KV cache, no probe)
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def measure_max_context(self) -> dict:
         """Report the engine's max context + KV-cache capacity.
@@ -625,9 +608,9 @@ class VLLMRuntime(RuntimeBase):
             pass
         return out
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Tokenizer access (convenience)
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     @property
     def tokenizer(self):
@@ -680,9 +663,9 @@ class VLLMRuntime(RuntimeBase):
         """
         return len(self.encode(text))
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # score_choices  (MMLU scoring — log-prob approximation via generation)
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def score_choices(
         self,
@@ -746,9 +729,9 @@ class VLLMRuntime(RuntimeBase):
 
         return scores
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Batch generate with per-request metadata  (convenience)
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def generate_with_metadata(
         self,
@@ -795,9 +778,9 @@ class VLLMRuntime(RuntimeBase):
 
         return results
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Internal guards
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def _check_loaded(self) -> None:
         """Raises RuntimeError if load() has not been called yet."""
@@ -806,9 +789,9 @@ class VLLMRuntime(RuntimeBase):
                 "VLLMRuntime: engine is not loaded. Call load(entry) first."
             )
 
-    # ════════════════════════════════════════════════════════════════════════════
+    
     # Dunder helpers
-    # ════════════════════════════════════════════════════════════════════════════
+    
 
     def __repr__(self) -> str:
         status = f"loaded='{self._model_id}'" if self._llm else "unloaded"

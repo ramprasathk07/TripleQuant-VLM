@@ -251,7 +251,6 @@ def patched_qwen2_attn_forward(
 # Apply the monkey-patch
 Qwen2Attention.forward = patched_qwen2_attn_forward
 
-
 # -------------------- Compression reporting ------------------------
 def compression_report(cache: "TurboDynamicCache") -> dict:
     """Compare TurboQuant KV storage against the FP16 KV you'd keep without it.
