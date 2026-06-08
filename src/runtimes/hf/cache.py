@@ -12,8 +12,16 @@ from .config import CacheConfig
 
 class TurboQuantCache(Cache):
     """General KV cache with ring buffer + compressed overflow."""
+
+    # transformers >=4.55 reads this during generation; the base property iterates
+    # self.layers (which this cache doesn't have). Not torch.compile-able.
+    is_compileable = False
+
     def __init__(self, model_config, cfg: CacheConfig):
-        super().__init__()
+        try:
+            super().__init__()
+        except TypeError:
+            pass
         self.cfg = cfg
         self.num_layers = model_config.num_hidden_layers
         self.num_kv_heads = getattr(model_config, "num_key_value_heads",
@@ -76,21 +84,35 @@ class TurboQuantCache(Cache):
     # HF Cache protocol methods
     def get_seq_length(self, layer_idx=0) -> int:
         return self._seq_len
-    
+
+    def get_mask_sizes(self, cache_position, layer_idx=0):
+        # (kv_length, kv_offset) for causal-mask construction. transformers >=4.55
+        # delegates to self.layers[idx]; this cache has none, so compute directly.
+        # Called before the decoder layers run: _seq_len is the PAST length and the
+        # current query tokens (cache_position) are added on top.
+        query_length = cache_position.shape[0]
+        return self._seq_len + query_length, 0
+
     def get_max_length(self) -> Optional[int]:
         return None
-    
+
     def reorder_cache(self, beam_idx):
         raise NotImplementedError("Beam search not supported")
-    
+
     def to_legacy_cache(self):
         return self
 
 
 class VLMCrossCache(Cache):
     """Separate cache for cross‑attention (visual tokens) in VLMs."""
+
+    is_compileable = False
+
     def __init__(self, num_layers, num_heads, head_dim, cfg: CacheConfig):
-        super().__init__()
+        try:
+            super().__init__()
+        except TypeError:
+            pass
         self.engines = [
             KVCaptureEngine(
                 store=CompressedKVStore(
@@ -126,6 +148,15 @@ class VLMCrossCache(Cache):
     
     def get_seq_length(self, layer_idx=0):
         return self._seq_len
-    
+
+    def get_mask_sizes(self, cache_position, layer_idx=0):
+        return self._seq_len + cache_position.shape[0], 0
+
+    def get_max_length(self):
+        return None
+
+    def to_legacy_cache(self):
+        return self
+
     def reorder_cache(self, beam_idx):
         raise NotImplementedError

@@ -347,7 +347,7 @@ class MetricsConfig(BaseModel):
         "gsm8k", "ceval", "humaneval", "aime",
     ]] = ["ppl"]
     quality_ocr: list[Literal["cer", "wer", "exact_match", "bleu"]] = ["cer"]
-    perf:        list[Literal["ttft", "tpot", "throughput", "ctx_sweep", "max_context"]] = ["throughput", "ttft", "tpot"]
+    perf:        list[Literal["ttft", "tpot", "throughput", "ctx_sweep", "max_context", "tq_bits_sweep"]] = ["throughput", "ttft", "tpot"]
     memory:      list[Literal["disk", "vram", "load_time"]] = ["disk", "vram"]
 
 class EvalDatasetConfig(BaseModel):
@@ -428,6 +428,14 @@ class LatencyConfig(BaseModel):
     ctx_sweep:   list[int] = [512, 2048, 8192]
     num_requests: int = 100
     warmup_requests: int = 5
+
+    # TurboQuant bits x accuracy x context-length sweep (perf metric "tq_bits_sweep").
+    # Each [key_bits, value_bits] pair is characterized at each context length; accuracy
+    # = next-token agreement vs FP16 KV. Lengths must exceed tq_sweep_ring to engage the
+    # compressed store.
+    tq_bits_pairs:     list[list[int]] = [[2, 2], [3, 2], [4, 4], [8, 8]]
+    tq_sweep_lengths:  list[int]       = [512, 1024, 2048, 4096]
+    tq_sweep_ring:     int             = 256
 
 class TurboQuantRuntimeConfig(BaseModel):
     """Per-model TurboQuant KV-cache settings for benchmarking.
@@ -522,7 +530,7 @@ class TrackingConfig(BaseModel):
         wandb_public: If True, create a public shareable W&B project link.
         wandb_api_key_env: Environment variable name for W&B API key.
     """
-    enabled: list[Literal["wandb", "langfuse", "mlflow"]] = ["wandb", "mlflow"]
+    enabled: list[Literal["wandb", "langfuse", "mlflow", "tensorboard"]] = ["wandb", "tensorboard"]
 
     wandb_project: str = "triplequant-vlm"
     wandb_entity: Optional[str] = None

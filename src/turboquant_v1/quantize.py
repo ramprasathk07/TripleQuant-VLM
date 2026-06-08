@@ -95,7 +95,7 @@ class TMSE(torch.nn.Module):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.register_buffer(
-            "RotateMatirx", generate_rotation_matrix(dim, self.device, dtype, seed=seed)
+            "RotateMatrix", generate_rotation_matrix(dim, self.device, dtype, seed=seed)
         )
 
         # Precompute codebook
@@ -110,7 +110,7 @@ class TMSE(torch.nn.Module):
         
         # Normalize to unit sphere
         x_unit = x / (norms.unsqueeze(-1) + 1e-10)
-        y = rotate_forward(x_unit.float(), self.RotateMatirx)
+        y = rotate_forward(x_unit.float(), self.RotateMatrix)
 
         # Quantize each coordinate: find bucket via searchsorted
         indices = torch.searchsorted(self.decision_boundaries, y.contiguous())
@@ -129,7 +129,7 @@ class TMSE(torch.nn.Module):
         y_hat = self.centroids[indices]  # (..., d)
 
         # Rotate back
-        x_hat = rotate_backward(y_hat, self.RotateMatirx)  # (..., d)
+        x_hat = rotate_backward(y_hat, self.RotateMatrix)  # (..., d)
 
         # Rescale by original norms
         x_hat = x_hat * q.norms.unsqueeze(-1)

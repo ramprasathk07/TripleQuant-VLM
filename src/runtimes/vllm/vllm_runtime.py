@@ -558,16 +558,6 @@ class VLLMRuntime(RuntimeBase):
             return 0.0
         return torch.cuda.max_memory_allocated() / (1024 ** 2)
 
-    def current_vram_mb(self) -> float:
-        """
-        Returns currently allocated VRAM in MB.
-        Useful for monitoring between eval steps.
-        """
-        if not torch.cuda.is_available():
-            return 0.0
-        return torch.cuda.memory_allocated() / (1024 ** 2)
-
-    
     # Max context  (read from engine config — vLLM pre-sizes the KV cache, no probe)
     
 

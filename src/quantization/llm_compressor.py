@@ -60,9 +60,8 @@ class LLMCompressorQuantizer(BaseQuantizer):
         # 4. Save the quantized model
         self.save(str(self.config.output.output_dir))
 
-        # 5. Export to onnx
-        
         logger.info("Quantization finished and model saved to %s", self.config.output.output_dir)
+
 
     def _load_calibration_dataset(self) -> Dataset:
         """Load and preprocess calibration dataset with format auto-detection.

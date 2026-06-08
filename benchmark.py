@@ -30,12 +30,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Logging setup ────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("benchmark")
+from src.utils import setup_global_logging
+logger = setup_global_logging("benchmark")
+
 
 from src.config import load_benchmark_config
 from src.config.schemas import BenchmarkConfig, BenchmarkModelEntry
@@ -72,13 +69,24 @@ def _dir_size_mb(path: Path) -> float:
         path: Directory path to measure.
 
     Returns:
-        Total size in MB (rounded to 2 decimals), or 0.0 if path does not
-        exist or is not a directory.
+        Total size in MB. For a local dir, sums its files. For a hub repo id
+        (is_local=False), reads the model's size from the HF cache. 0.0 if neither.
     """
-    if not path.exists() or not path.is_dir():
-        return 0.0
-    total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-    return round(total / (1024 ** 2), 2)
+    if path.exists() and path.is_dir():
+        total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        return round(total / (1024 ** 2), 2)
+    # Not a local dir → treat as a hub repo id and read its cached size on disk.
+    # Normalize backslashes: Path() rewrites "Qwen/Qwen3-1.7B" with the OS separator,
+    # but repo_id always uses "/".
+    repo_id = str(path).replace("\\", "/")
+    try:
+        from huggingface_hub import scan_cache_dir
+        for repo in scan_cache_dir().repos:
+            if repo.repo_id == repo_id:
+                return round(repo.size_on_disk / (1024 ** 2), 2)
+    except Exception:
+        pass
+    return 0.0
 
 
 def _resolve_checkpoint_dir(path: str) -> str:
@@ -101,7 +109,7 @@ def _resolve_checkpoint_dir(path: str) -> str:
         return path
     subdirs = [d for d in p.iterdir() if d.is_dir() and (d / "config.json").exists()]
     if len(subdirs) == 1:
-        logger.info("Resolved checkpoint dir: '%s' → '%s'", path, subdirs[0])
+        logger.info("Resolved checkpoint dir: '%s' -> '%s'", path, subdirs[0])
         return str(subdirs[0])
     return path
 
@@ -244,23 +252,16 @@ def _run_quality_ocr(runtime, runtime_name: str, entry: BenchmarkModelEntry,
     return {name: _one(name) for name in names}
 
 
-def _run_perf(runtime, config: BenchmarkConfig) -> dict:
-    """Benchmark performance metrics: latency, throughput, and memory usage.
+def _run_perf(runtime, entry: BenchmarkModelEntry, config: BenchmarkConfig) -> dict:
+    """Benchmark performance metrics (latency, throughput, context capacity).
 
-    Delegates to the performance runner (src.evaluation.performance) which
-    orchestrates measurements with OOM isolation: a GPU out-of-memory at any
-    measurement stage is caught and recorded as a marker, not a fatal crash.
-
-    Args:
-        runtime: Initialized model runtime.
-        config: BenchmarkConfig with performance measurement parameters.
-
-    Returns:
-        Dict with keys: latency (ttft_ms_p50, tpot_ms_p50), throughput
-        (list of token rates at varying batch sizes), and context capacity.
+    Delegates to the OOM-isolated performance runner. The TQ bits/accuracy sweep
+    only runs for TurboQuant-enabled entries (it characterizes TQ, identical on the
+    baseline), so it isn't duplicated.
     """
     from src.evaluation.performance import run_perf_metrics
-    return run_perf_metrics(runtime, config, perf_prompt=_PERF_PROMPT)
+    return run_perf_metrics(runtime, config, perf_prompt=_PERF_PROMPT,
+                            tq_enabled=entry.turboquant_enabled)
 
 
 def _run_memory(runtime, entry: BenchmarkModelEntry,
@@ -322,7 +323,7 @@ def _run_model_on_runtime(
 
     results: dict = {}
 
-    logger.info("[%s @ %s] Loading model …", entry.name, runtime_name)
+    logger.info("[%s @ %s] Loading model ...", entry.name, runtime_name)
     t0 = time.perf_counter()
     try:
         runtime = build_runtime(runtime_name, entry)   # instantiates + loads
@@ -340,7 +341,7 @@ def _run_model_on_runtime(
             "memory":      lambda: _run_memory(runtime, entry, load_time_s, config),
             "quality_llm": lambda: _run_quality_llm(runtime, runtime_name, config),
             "quality_ocr": lambda: _run_quality_ocr(runtime, runtime_name, entry, config),
-            "perf":        lambda: _run_perf(runtime, config),
+            "perf":        lambda: _run_perf(runtime, entry, config),
         }
         for group_name, fn in groups.items():
             logger.info("[%s @ %s] metric group: %s", entry.name, runtime_name, group_name)
@@ -413,48 +414,216 @@ def _init_wandb(config: BenchmarkConfig):
         return None
     try:
         from src.tracking.wandb_connector import WandBLogger
+        # track_gpu=False: the per-run GPU background thread logs with auto-steps,
+        # which races with our explicit-step scalar logs and causes wandb to drop
+        # them ("not monotonic" → empty charts). Peak VRAM is already captured in
+        # the memory metrics, so the thread adds little here.
         return WandBLogger(
             project_name=config.tracking.wandb_project,
             entity=config.tracking.wandb_entity,
+            track_gpu=False,
         )
     except Exception as exc:
         logger.warning("W&B tracking disabled (init failed): %s", exc)
         return None
 
 
+def _curated_scalars(metrics: dict) -> dict:
+    """Headline perf / memory / quality scalars to log as comparison panels.
+
+    A curated subset (not every nested value) so the W&B workspace shows clean,
+    cross-run bar panels instead of dozens of single-point charts.
+    """
+    out: dict = {}
+    num = (int, float)
+
+    mem = metrics.get("memory", {})
+    if isinstance(mem, dict):
+        for k in ("peak_vram_mb", "disk_mb", "load_time_s"):
+            if isinstance(mem.get(k), num):
+                out[f"memory/{k}"] = mem[k]
+
+    perf = metrics.get("perf", {})
+    if isinstance(perf, dict):
+        lat = perf.get("latency", {})
+        if isinstance(lat, dict):
+            for k in ("ttft_ms_p50", "ttft_ms_p99", "tpot_ms_p50", "tpot_ms_p99"):
+                if isinstance(lat.get(k), num):
+                    out[f"latency/{k}"] = lat[k]
+        tps = [r.get("tokens_per_sec", 0) for r in _tput_rows(metrics)]
+        if tps:
+            out["throughput/best_tokens_per_sec"] = max(tps)
+        mc = perf.get("max_context", {})
+        if isinstance(mc, dict):
+            for k in ("measured_max_tokens", "model_max_positions"):
+                if isinstance(mc.get(k), num):
+                    out[f"max_context/{k}"] = mc[k]
+        cs = perf.get("ctx_sweep", {})
+        if isinstance(cs, dict) and isinstance(cs.get("est_max_ctx_tokens"), num):
+            out["max_context/est_max_ctx_tokens"] = cs["est_max_ctx_tokens"]
+
+    q = metrics.get("quality_llm", {})
+    if isinstance(q, dict):
+        if isinstance(q.get("ppl"), num):
+            out["quality/ppl"] = q["ppl"]
+        if isinstance(q.get("mmlu_acc"), num):
+            out["quality/mmlu_acc"] = q["mmlu_acc"]
+        for name in ("gsm8k", "aime", "ceval"):
+            v = q.get(name)
+            if isinstance(v, dict) and isinstance(v.get("acc"), num):
+                out[f"quality/{name}_acc"] = v["acc"]
+    qo = metrics.get("quality_ocr", {})
+    if isinstance(qo, dict):
+        for k in ("cer", "wer", "exact_match", "bleu"):
+            if isinstance(qo.get(k), num):
+                out[f"quality/{k}"] = qo[k]
+    return out
+
+
+def _ctx_rows(metrics: dict) -> list:
+    sweep = metrics.get("perf", {}).get("ctx_sweep", {})
+    series = sweep.get("series", []) if isinstance(sweep, dict) else []
+    return [s for s in series if s.get("fits")]
+
+
+def _bits_grid(metrics: dict) -> list:
+    sweep = metrics.get("perf", {}).get("tq_bits_sweep", {})
+    return sweep.get("grid", []) if isinstance(sweep, dict) else []
+
+
+def _tput_rows(metrics: dict) -> list:
+    tput = metrics.get("perf", {}).get("throughput", [])
+    return [r for r in tput if isinstance(r, dict) and not r.get("oom")] if isinstance(tput, list) else []
+
+
+def _log_wandb_charts(run, metrics: dict) -> None:
+    """Log the curated W&B charts: context sweep, TQ bits sweep, throughput."""
+    import wandb
+    panels: dict = {}
+
+    rows = _ctx_rows(metrics)
+    if rows:
+        lens = [r["context_len"] for r in rows]
+        panels["ctx_sweep/kv_cache_mb_vs_len"] = wandb.plot.line_series(
+            xs=lens, keys=["turboquant", "fp16"],
+            ys=[[r["kv_cache_mb"] for r in rows], [r.get("fp16_kv_mb") for r in rows]],
+            title="Resident KV cache (MB) vs context length", xname="context_len")
+        ctx_table = wandb.Table(
+            columns=["context_len", "kv_cache_mb", "fp16_kv_mb", "compression_ratio", "peak_vram_mb"],
+            data=[[r["context_len"], r["kv_cache_mb"], r.get("fp16_kv_mb"),
+                   r.get("compression_ratio"), r.get("peak_vram_mb")] for r in rows])
+        panels["ctx_sweep/compression_vs_len"] = wandb.plot.line(
+            ctx_table, "context_len", "compression_ratio", title="KV compression ratio vs context length")
+        panels["ctx_sweep/peak_vram_vs_len"] = wandb.plot.line(
+            ctx_table, "context_len", "peak_vram_mb", title="Peak VRAM (MB) vs context length")
+        panels["ctx_sweep/table"] = ctx_table
+
+    grid = _bits_grid(metrics)
+    if grid:
+        lengths = sorted({g["context_len"] for g in grid})
+        bits = sorted({g["bits"] for g in grid})
+
+        def _series(field):
+            by = {b: {} for b in bits}
+            for g in grid:
+                by[g["bits"]][g["context_len"]] = g.get(field)
+            return [[by[b].get(L) for L in lengths] for b in bits]
+
+        panels["tq_bits/top5_agreement_vs_len"] = wandb.plot.line_series(
+            xs=lengths, ys=_series("top5_agreement"), keys=bits,
+            title="Top-5 next-token agreement vs FP16 (by bits)", xname="context_len")
+        panels["tq_bits/top1_agreement_vs_len"] = wandb.plot.line_series(
+            xs=lengths, ys=_series("top1_agreement"), keys=bits,
+            title="Top-1 next-token agreement vs FP16 (by bits)", xname="context_len")
+        panels["tq_bits/kl_div_vs_len"] = wandb.plot.line_series(
+            xs=lengths, ys=_series("kl_div"), keys=bits,
+            title="KL(FP16 || TQ) vs context length (by bits)", xname="context_len")
+        panels["tq_bits/kv_cache_mb_vs_len"] = wandb.plot.line_series(
+            xs=lengths, ys=_series("kv_cache_mb"), keys=bits,
+            title="Resident KV cache (MB) vs context length (by bits)", xname="context_len")
+        panels["tq_bits/table"] = wandb.Table(
+            columns=["bits", "context_len", "top1_agreement", "top5_agreement",
+                     "kl_div", "kv_cache_mb", "compression_ratio"],
+            data=[[g["bits"], g["context_len"], g["top1_agreement"], g.get("top5_agreement"),
+                   g.get("kl_div"), g.get("kv_cache_mb"), g.get("compression_ratio")] for g in grid])
+
+    tput = _tput_rows(metrics)
+    if tput:
+        tp_table = wandb.Table(
+            columns=["batch_size", "tokens_per_sec", "latency_ms", "turboquant"],
+            data=[[r["batch_size"], r.get("tokens_per_sec"), r.get("latency_ms"),
+                   bool(r.get("turboquant"))] for r in tput])
+        panels["throughput/tps_vs_batch"] = wandb.plot.line(
+            tp_table, "batch_size", "tokens_per_sec", title="Throughput (tok/s) vs batch size")
+        panels["throughput/table"] = tp_table
+
+    if panels:
+        run.log(panels)
+
+
 def _log_record_to_wandb(tracker, record: dict, entry: BenchmarkModelEntry,
                          runtime_name: str, config: BenchmarkConfig, arch: str) -> None:
-    """Log one (model, runtime) record as a dedicated W&B run. Best-effort."""
+    """Log one (model, runtime) record as a dedicated W&B run. Best-effort.
+
+    Scalars go to run.summary (the cross-model comparison table) only — NOT
+    run.log — so each scalar doesn't spawn its own single-point time-series panel.
+    Curated sweep charts are the only logged panels.
+    """
     if tracker is None:
         return
-    run_name = f"{entry.name} @ {runtime_name}"
-    if entry.turboquant_enabled:
-        run_name += " +tq"
+    run_name = f"{entry.name} @ {runtime_name}" + (" +tq" if entry.turboquant_enabled else "")
     try:
         run_cfg = {
-            "model_name": entry.name,
-            "model_path": entry.path,
-            "model_type": entry.model_type,
-            "model_class": entry.model_class,
-            "runtime": runtime_name,
-            "dtype": entry.dtype,
+            "model_name": entry.name, "model_path": entry.path,
+            "model_type": entry.model_type, "model_class": entry.model_class,
+            "runtime": runtime_name, "dtype": entry.dtype,
             "hf_quantization": entry.hf_quantization,
             "vllm_quantization": entry.vllm_quantization,
             "turboquant": entry.turboquant.model_dump() if entry.turboquant else None,
-            "gpu_arch": arch,
-            "benchmark_run": config.run_name,
-            "status": record.get("status"),
+            "gpu_arch": arch, "benchmark_run": config.run_name,
         }
         tracker.start_run(run_name=run_name, config=run_cfg)
-        flat = _flatten_metrics(record.get("metrics", {}))
-        if flat:
-            tracker.log_metrics(flat)
-            # Also surface every scalar in the run summary for the comparison table.
-            if tracker._current_run is not None:
-                tracker._current_run.summary.update(flat)
+        run = tracker._current_run
+        if run is not None:
+            m = record.get("metrics", {})
+            # Curated headline scalars as comparison panels; full set in summary.
+            run.log(_curated_scalars(m))
+            run.summary.update(_flatten_metrics(m))
+            run.summary["status"] = record.get("status")
+            _log_wandb_charts(run, m)
         tracker.finish_current_run()
     except Exception as exc:
         logger.warning("W&B logging failed for '%s': %s", run_name, exc)
+
+
+def _log_record_to_tensorboard(tb_dir: Path, tag: str, record: dict) -> None:
+    """Mirror a record to TensorBoard: flat scalars + sweep curves (step = x-axis)."""
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except Exception:
+        return
+    import re
+    safe = re.sub(r"[^0-9A-Za-z._@+-]+", "_", tag)
+    try:
+        w = SummaryWriter(log_dir=str(tb_dir / safe))
+        m = record.get("metrics", {})
+        for k, v in _flatten_metrics(m).items():
+            w.add_scalar(k, v)
+        for s in _ctx_rows(m):
+            L = s["context_len"]
+            w.add_scalar("ctx_sweep/kv_cache_mb", s["kv_cache_mb"], L)
+            w.add_scalar("ctx_sweep/peak_vram_mb", s["peak_vram_mb"], L)
+            w.add_scalar("ctx_sweep/compression_ratio", s.get("compression_ratio", 1.0), L)
+        for g in _bits_grid(m):
+            L, b = g["context_len"], g["bits"]
+            w.add_scalar(f"tq_bits_top1/{b}", g["top1_agreement"], L)
+            w.add_scalar(f"tq_bits_top5/{b}", g.get("top5_agreement", 0.0), L)
+            w.add_scalar(f"tq_bits_kv_mb/{b}", g.get("kv_cache_mb", 0.0), L)
+        for r in _tput_rows(m):
+            w.add_scalar("throughput/tokens_per_sec", r["tokens_per_sec"], r["batch_size"])
+        w.close()
+    except Exception as exc:
+        logger.warning("TensorBoard logging failed for '%s': %s", tag, exc)
 
 
 # Summary
@@ -548,7 +717,7 @@ def _print_summary_table(summary: dict) -> None:
     cols = core_cols + shown
 
     header = "".join(f"{h:<{w}}" for _, h, _, w in cols)
-    sep = "─" * len(header)
+    sep = "-" * len(header)
     logger.info(sep)
     logger.info(header)
     logger.info(sep)
@@ -596,19 +765,19 @@ def main() -> None:
     results_dir = Path(config.output_root) / config.run_name
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("─" * 60)
+    logger.info("-" * 60)
     logger.info("Benchmark plan: %s", config.run_name)
     for i, m in enumerate(config.models, 1):
-        logger.info("  [%d] %-20s → %s (%s)", i, m.name, m.path, m.model_type)
+        logger.info("  [%d] %-20s -> %s (%s)", i, m.name, m.path, m.model_type)
     logger.info("  Runtimes : %s", config.runtimes)
     logger.info("  Metrics  : llm=%s ocr=%s perf=%s mem=%s",
                 config.metrics.quality_llm, config.metrics.quality_ocr,
                 config.metrics.perf, config.metrics.memory)
     logger.info("  Results  : %s/", results_dir)
-    logger.info("─" * 60)
+    logger.info("-" * 60)
 
     if args.dry_run:
-        logger.info("--dry-run: config valid ✓ — stopping before model load.")
+        logger.info("--dry-run: config valid [OK] - stopping before model load.")
         return
 
     all_results: dict[str, dict] = {}
@@ -616,7 +785,11 @@ def main() -> None:
     arch = _detect_arch()
     tracker = _init_wandb(config)
     if tracker is not None:
-        logger.info("W&B tracking on → project '%s'", config.tracking.wandb_project)
+        logger.info("W&B tracking on -> project '%s'", config.tracking.wandb_project)
+    tb_dir = results_dir / "tensorboard" if "tensorboard" in config.tracking.enabled else None
+    if tb_dir is not None:
+        logger.info("TensorBoard logging on -> %s  (view: tensorboard --logdir %s)",
+                    tb_dir, tb_dir)
 
     for entry in config.models:
         if arch and arch in entry.skip_on:
@@ -675,9 +848,11 @@ def main() -> None:
             out_path = results_dir / f"{_safe_filename(entry.name)}_{runtime_name}_{run_ts}.json"
             with out_path.open("w", encoding="utf-8") as f:
                 json.dump(record, f, indent=2, default=str)
-            logger.info("💾 Saved → %s", out_path)
+            logger.info("Saved -> %s", out_path)
 
             _log_record_to_wandb(tracker, record, entry, runtime_name, config, arch)
+            if tb_dir is not None:
+                _log_record_to_tensorboard(tb_dir, f"{entry.name}@{runtime_name}", record)
 
     summary = _build_comparison_summary(all_results)
     summary_path = results_dir / f"comparison_summary_{run_ts}.json"
@@ -685,7 +860,7 @@ def main() -> None:
         json.dump(summary, f, indent=2, default=str)
 
     logger.info("=" * 60)
-    logger.info("✅ Benchmark complete. Summary → %s", summary_path)
+    logger.info("Benchmark complete. Summary -> %s", summary_path)
     logger.info("=" * 60)
     _print_summary_table(summary)
 

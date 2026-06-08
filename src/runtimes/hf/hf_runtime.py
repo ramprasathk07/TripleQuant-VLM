@@ -304,6 +304,11 @@ class HFRuntime(RuntimeBase):
         from .cache import TurboQuantCache
         return TurboQuantCache(self.model.config, self._tq_cfg)
 
+    def _tq_gen_kwargs(self, batch_size: int) -> dict:
+        """generate() kwargs that route through a fresh TurboQuant cache, or {}."""
+        cache = self._maybe_tq_cache(batch_size)
+        return {"past_key_values": cache, "use_cache": True} if cache is not None else {}
+
     def load(self, entry: "BenchmarkModelEntry") -> None:
         """Load model and tokenizer/processor from Hugging Face.
 
@@ -597,12 +602,7 @@ class HFRuntime(RuntimeBase):
         )
         if do_sample:
             gen_kwargs["temperature"] = temperature
-
-        # Route generation through the TurboQuant cache when enabled (single-seq only).
-        tq_cache = self._maybe_tq_cache(len(prompts))
-        if tq_cache is not None:
-            gen_kwargs["past_key_values"] = tq_cache
-            gen_kwargs["use_cache"] = True
+        gen_kwargs.update(self._tq_gen_kwargs(len(prompts)))   # TurboQuant when enabled (bs=1)
 
         with torch.no_grad():
             output_ids = self.model.generate(**inputs, **gen_kwargs)
@@ -820,14 +820,12 @@ class HFRuntime(RuntimeBase):
             _sync_cuda()
             t0 = time.perf_counter()
             with torch.no_grad():
-                _ttft_extra = {"past_key_values": self._maybe_tq_cache(1), "use_cache": True} \
-                    if self._tq_cfg is not None else {}
                 _ = self.model.generate(
                     **inputs,
                     max_new_tokens = 1,
                     do_sample      = False,
                     pad_token_id   = self.tokenizer.pad_token_id,
-                    **_ttft_extra,
+                    **self._tq_gen_kwargs(1),
                 )
             _sync_cuda()
             ttft_ms = (time.perf_counter() - t0) * 1_000
@@ -836,8 +834,6 @@ class HFRuntime(RuntimeBase):
             _sync_cuda()
             t1 = time.perf_counter()
             with torch.no_grad():
-                _tpot_extra = {"past_key_values": self._maybe_tq_cache(1), "use_cache": True} \
-                    if self._tq_cfg is not None else {}
                 out = self.model.generate(
                     **inputs,
                     max_new_tokens          = OUTPUT_TOKENS,
@@ -846,7 +842,7 @@ class HFRuntime(RuntimeBase):
                     return_dict_in_generate = True,
                     output_scores           = True,
                     pad_token_id            = self.tokenizer.pad_token_id,
-                    **_tpot_extra,
+                    **self._tq_gen_kwargs(1),
                 )
             _sync_cuda()
             total_ms    = (time.perf_counter() - t1) * 1_000
@@ -937,16 +933,14 @@ class HFRuntime(RuntimeBase):
                     _sync_cuda()
                     t0 = time.perf_counter()
                     with torch.no_grad():
-                        # TurboQuant cache only at bs=1 (batched falls back to default).
-                        _tp_extra = {"past_key_values": self._maybe_tq_cache(bs), "use_cache": True} \
-                            if self._tq_cfg is not None and bs == 1 else {}
+                        # TurboQuant cache only at bs=1 (_tq_gen_kwargs returns {} otherwise).
                         self.model.generate(
                             **inputs,
                             max_new_tokens = output_len,
                             min_new_tokens = output_len,   # force full length (no early EOS) for stable tok/s
                             do_sample      = False,
                             pad_token_id   = self.tokenizer.pad_token_id,
-                            **_tp_extra,
+                            **self._tq_gen_kwargs(bs),
                         )
                     _sync_cuda()
                     latencies_ms.append((time.perf_counter() - t0) * 1_000)
@@ -981,6 +975,9 @@ class HFRuntime(RuntimeBase):
                 "latency_ms":     round(median_latency_ms, 2),
                 "total_tokens":   total_tokens,
                 "oom":            False,
+                # TurboQuant is single-sequence; bs>1 silently runs the default cache,
+                # so flag whether this row actually exercised TQ (avoids misleading bars).
+                "turboquant":     bool(self._tq_cfg is not None and bs == 1),
             })
 
             logger.info(
@@ -1002,16 +999,6 @@ class HFRuntime(RuntimeBase):
             return 0.0
         return torch.cuda.max_memory_allocated() / (1024 ** 2)
 
-    def current_vram_mb(self) -> float:
-        """
-        Returns currently allocated VRAM in MB.
-        Useful for monitoring between eval steps.
-        """
-        if not torch.cuda.is_available():
-            return 0.0
-        return torch.cuda.memory_allocated() / (1024 ** 2)
-
-    
     # Max context probe
     def _model_max_positions(self) -> Optional[int]:
         """Best-effort read of the model's max position embeddings (handles VLM text_config)."""
@@ -1118,6 +1105,215 @@ class HFRuntime(RuntimeBase):
             "oom_at_tokens":       first_fail,
             "capped_by":           "oom",
         }
+
+    # Context-length sweep: resident KV memory vs context length (TurboQuant-aware)
+    def _kv_bytes_per_token(self) -> int:
+        """Resident bytes of FP16 KV cache for ONE token, across all layers (K+V)."""
+        cfg = self.model.config
+        n_layers = getattr(cfg, "num_hidden_layers", 0)
+        n_kv = getattr(cfg, "num_key_value_heads", getattr(cfg, "num_attention_heads", 0))
+        head_dim = getattr(cfg, "hidden_size", 0) // max(getattr(cfg, "num_attention_heads", 1), 1)
+        return n_layers * n_kv * head_dim * 2 * 2   # 2 bytes (bf16) * 2 (K and V)
+
+    def _tq_resident_kv_mb(self, cache) -> float:
+        """Resident KV MB held by a TurboQuantCache (exact ring bf16 + packed store)."""
+        total = 0
+        for eng in cache.engines:
+            ring = eng.ring.size * cache.num_kv_heads * cache.head_dim * 2 * 2  # bf16 K+V
+            total += ring + eng.store.memory_bytes()
+        return total / (1024 ** 2)
+
+    def measure_ctx_sweep(self, lengths: list[int]) -> dict:
+        """Resident KV-cache memory at increasing context lengths (the metric where
+        TurboQuant actually shows up — KV dominates only at long context).
+
+        For each length L it prefills L random tokens through the model with a cache
+        (TurboQuant when enabled, else the default), then records the *resident* KV
+        memory and peak VRAM. Stops at the first OOM. Also estimates the max context
+        that fits = free-VRAM-after-load / KV-bytes-per-token (compressed for TQ).
+
+        Returns:
+            {
+              "series": [{context_len, kv_cache_mb, peak_vram_mb, fits}, ...],
+              "max_fit_tokens": int,            # last length that fit a forward
+              "est_max_ctx_tokens": int | None, # free VRAM / per-token KV bytes
+              "kv_bytes_per_token_fp16": int,
+              "turboquant": bool,
+            }
+        """
+        self._check_loaded()
+        vocab = int(getattr(self.model.config, "vocab_size", 32000) or 32000)
+        fp16_bpt = self._kv_bytes_per_token()
+        series, max_fit = [], 0
+
+        for L in sorted(lengths):
+            if not torch.cuda.is_available():
+                break
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            try:
+                ids = torch.randint(0, vocab, (1, L), device=self._device)
+                cache = self._maybe_tq_cache(1)   # TQ cache when enabled, else None
+                with torch.no_grad():
+                    if cache is not None:
+                        self.model(input_ids=ids, past_key_values=cache, use_cache=True)
+                        kv_mb = self._tq_resident_kv_mb(cache)
+                    else:
+                        self.model(input_ids=ids, use_cache=True)
+                        kv_mb = (L * fp16_bpt) / (1024 ** 2)   # dense fp16 KV
+                fp16_kv_mb = (L * fp16_bpt) / (1024 ** 2)
+                series.append({
+                    "context_len": L,
+                    "kv_cache_mb": round(kv_mb, 3),
+                    "fp16_kv_mb": round(fp16_kv_mb, 3),
+                    "compression_ratio": round(fp16_kv_mb / kv_mb, 2) if kv_mb else 1.0,
+                    "peak_vram_mb": round(self.peak_vram_mb(), 1),
+                    "fits": True,
+                })
+                max_fit = L
+                del ids, cache
+                torch.cuda.empty_cache()
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" not in str(e).lower() and not isinstance(e, torch.cuda.OutOfMemoryError):
+                    raise
+                series.append({"context_len": L, "fits": False})
+                torch.cuda.empty_cache()
+                break
+
+        # Estimate max context from free VRAM and the per-token KV cost. For TQ the
+        # effective per-token cost is the measured compressed rate at the largest L.
+        est_max = None
+        if torch.cuda.is_available():
+            free_b, _ = torch.cuda.mem_get_info()
+            bpt = fp16_bpt
+            tq_pts = [s for s in series if s.get("fits") and s["context_len"] > self._tq_cfg.ring_capacity] \
+                if self._tq_cfg is not None else []
+            if tq_pts:
+                s = tq_pts[-1]
+                bpt = max((s["kv_cache_mb"] * (1024 ** 2)) / s["context_len"], 1)
+            est_max = int(free_b / bpt)
+
+        return {
+            "series": series,
+            "max_fit_tokens": max_fit,
+            "est_max_ctx_tokens": est_max,
+            "kv_bytes_per_token_fp16": fp16_bpt,
+            "turboquant": self._tq_cfg is not None,
+        }
+
+    # TurboQuant bits x accuracy x context-length characterization
+    def _real_input_ids(self, max_len: int) -> "Tensor":
+        """A real token sequence of length max_len (wikitext; random fallback)."""
+        try:
+            from src.utils import load_wikitext
+            ds = load_wikitext(split="test", num_samples=200)
+            text = "\n\n".join(t for t in ds["text"] if t and t.strip())
+            ids = self.tokenizer(text, return_tensors="pt").input_ids[:, :max_len]
+            if ids.shape[1] >= max_len:
+                return ids.to(self._device)
+        except Exception as e:
+            logger.warning("[bits_sweep] wikitext load failed (%s); using random tokens.", e)
+        vocab = int(getattr(self.model.config, "vocab_size", 32000) or 32000)
+        return torch.randint(0, vocab, (1, max_len), device=self._device)
+
+    def measure_bits_accuracy(
+        self,
+        bit_pairs: list[list[int]],
+        lengths:   list[int],
+        ring_capacity: int = 256,
+    ) -> dict:
+        """Next-token agreement vs FP16 KV, swept over bit budgets x context length.
+
+        TurboQuant is a decode-time KV codec, so its quality impact only appears in
+        the attention/decode path. For each context length L we take a real prompt,
+        compute the FP16 next-token distribution, then for each [key_bits, value_bits]
+        rebuild the model's KV through a TurboQuantCache and measure how much the
+        predictions changed:
+          - top1_agreement: fraction of positions whose argmax matches FP16
+          - kl_div:         mean KL(FP16 || TQ) over the compared positions
+        Positions before ``ring_capacity`` are exact (in the ring), so only the
+        compressed tail [ring_capacity:] is compared.
+
+        Returns {"grid": [{key_bits, value_bits, bits, context_len, top1_agreement,
+        kl_div, n_positions}], "ring_capacity": int}.
+        """
+        self._check_loaded()
+        if not torch.cuda.is_available():
+            return {"skipped": "needs CUDA"}
+        from .cache import TurboQuantCache
+        from .config import CacheConfig
+        from .patcher import patch_model_attention
+        patch_model_attention(self.model)   # idempotent; defers to original for non-TQ caches
+
+        dtype_name = (getattr(self.model, "dtype", None) and str(self.model.dtype).split(".")[-1]) or "bfloat16"
+        grid = []
+        max_len = max(lengths)
+        full_ids = self._real_input_ids(max_len)
+
+        for L in sorted(lengths):
+            if L <= ring_capacity:
+                continue   # nothing compressed → trivially identical to FP16
+            ids = full_ids[:, :L]
+            # Compare only the LAST `compare` positions. In real decode the ring always
+            # holds the *current* token's most-recent `ring_capacity` tokens exact, with
+            # only the far history compressed — that's the regime that matters. Comparing
+            # all [ring:] positions is unrealistically harsh because mid-sequence tokens'
+            # recent context lands in the compressed store, not the ring.
+            compare = min(64, L - ring_capacity)
+            try:
+                with torch.no_grad():
+                    base_logits = self.model(input_ids=ids, use_cache=False).logits[0]  # (L, V)
+                base_arg = base_logits[-compare:].argmax(dim=-1)                          # (compare,)
+                base_logp = torch.log_softmax(base_logits[-compare:].float(), dim=-1)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" not in str(e).lower() and not isinstance(e, torch.cuda.OutOfMemoryError):
+                    raise
+                torch.cuda.empty_cache()
+                break   # bigger L will also OOM
+
+            for kb, vb in bit_pairs:
+                try:
+                    cfg = CacheConfig(ring_capacity=ring_capacity, key_bits=kb, value_bits=vb,
+                                      use_qjl=False, use_compressed_store=True,
+                                      device=str(self._device), dtype=dtype_name)
+                    cache = TurboQuantCache(self.model.config, cfg)
+                    with torch.no_grad():
+                        tq_logits = self.model(input_ids=ids, past_key_values=cache,
+                                               use_cache=True).logits[0]
+                    tq_slice = tq_logits[-compare:]
+                    agree = (tq_slice.argmax(dim=-1) == base_arg).float().mean().item()
+                    # Top-5 agreement: FP16's argmax lands in TQ's top-5 (argmax alone
+                    # is too strict — a small prob shift between synonyms flips it).
+                    tq_top5 = tq_slice.topk(5, dim=-1).indices
+                    top5 = (tq_top5 == base_arg.unsqueeze(-1)).any(dim=-1).float().mean().item()
+                    # KL(FP16 || TQ), averaged over positions. kl_div(input=log q,
+                    # target=p) computes sum p*(log p - log q); base_logp is log p.
+                    tq_logp = torch.log_softmax(tq_slice.float(), dim=-1)
+                    kl = torch.nn.functional.kl_div(
+                        tq_logp, base_logp, log_target=True, reduction="batchmean"
+                    ).item()
+                    kv_mb = self._tq_resident_kv_mb(cache)
+                    fp16_kv_mb = (L * self._kv_bytes_per_token()) / (1024 ** 2)
+                    grid.append({
+                        "key_bits": kb, "value_bits": vb, "bits": f"K{kb}V{vb}",
+                        "context_len": L,
+                        "top1_agreement": round(agree, 4),
+                        "top5_agreement": round(top5, 4),
+                        "kl_div": round(kl, 5),
+                        "kv_cache_mb": round(kv_mb, 3),
+                        "compression_ratio": round(fp16_kv_mb / kv_mb, 2) if kv_mb else None,
+                        "n_positions": int(base_arg.numel()),
+                    })
+                    del cache, tq_logits
+                    torch.cuda.empty_cache()
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    if "out of memory" not in str(e).lower() and not isinstance(e, torch.cuda.OutOfMemoryError):
+                        raise
+                    torch.cuda.empty_cache()
+            del base_logits, base_logp
+            torch.cuda.empty_cache()
+
+        return {"grid": grid, "ring_capacity": ring_capacity}
 
     # Extras: score_choices (used by eval_mmlu_tiny)
     def score_choices(

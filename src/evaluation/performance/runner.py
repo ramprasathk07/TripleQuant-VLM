@@ -76,13 +76,16 @@ def oom_safe(label: str, fn: Callable[[], dict | list]) -> dict | list:
 
 
 # Orchestration
-def run_perf_metrics(runtime, config, perf_prompt: str = _DEFAULT_PERF_PROMPT) -> dict:
+def run_perf_metrics(runtime, config, perf_prompt: str = _DEFAULT_PERF_PROMPT,
+                     tq_enabled: bool = False) -> dict:
     """Run all enabled perf metrics for *runtime*, each guarded against OOM.
 
     Args:
         runtime:     A loaded runtime (HFRuntime / VLLMRuntime).
         config:      BenchmarkConfig — reads ``metrics.perf`` and ``latency``.
         perf_prompt: Prompt used for latency/throughput trials.
+        tq_enabled:  Whether this entry has TurboQuant on (gates the TQ-only
+                     bits/accuracy sweep so it isn't duplicated on the baseline).
 
     Returns:
         dict keyed by metric. Any metric that OOMs maps to ``{"oom": True}``;
@@ -113,5 +116,26 @@ def run_perf_metrics(runtime, config, perf_prompt: str = _DEFAULT_PERF_PROMPT) -
             out["max_context"] = oom_safe("max_context", runtime.measure_max_context)
         else:
             out["max_context"] = {"skipped": "runtime has no measure_max_context()"}
+
+    if "ctx_sweep" in wanted:
+        if hasattr(runtime, "measure_ctx_sweep"):
+            out["ctx_sweep"] = oom_safe(
+                "ctx_sweep",
+                lambda: runtime.measure_ctx_sweep(lat.ctx_sweep),
+            )
+        else:
+            out["ctx_sweep"] = {"skipped": "runtime has no measure_ctx_sweep()"}
+
+    # TQ bits/accuracy sweep characterizes TurboQuant — only run it on the TQ entry
+    # so the baseline doesn't duplicate the identical (model-only) result.
+    if "tq_bits_sweep" in wanted and tq_enabled:
+        if hasattr(runtime, "measure_bits_accuracy"):
+            out["tq_bits_sweep"] = oom_safe(
+                "tq_bits_sweep",
+                lambda: runtime.measure_bits_accuracy(
+                    lat.tq_bits_pairs, lat.tq_sweep_lengths, lat.tq_sweep_ring),
+            )
+        else:
+            out["tq_bits_sweep"] = {"skipped": "runtime has no measure_bits_accuracy()"}
 
     return out

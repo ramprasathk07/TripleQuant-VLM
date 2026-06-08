@@ -20,13 +20,11 @@ from pathlib import Path
 import yaml
 from src.config.schemas import QuantizeConfig
 from src.quantization.factory import get_quantizer
+from src.utils import setup_global_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
+# Configure logging to console and log/ directory
+logger = setup_global_logging("quantize")
+
 
 
 def main() -> None:

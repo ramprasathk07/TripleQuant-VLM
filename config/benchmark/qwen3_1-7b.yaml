@@ -11,13 +11,14 @@ metrics:
   # quality_llm: ["ppl", "mmlu_tiny", "gsm8k", "ceval", "aime", "humaneval"]
   quality_llm: ["ppl", "mmlu_tiny"]
   quality_ocr: []
-  perf:        ["ttft", "tpot", "throughput", "max_context"]
+  perf:        ["ttft", "tpot", "throughput", "max_context", "ctx_sweep", "tq_bits_sweep"]
   memory:      ["disk", "vram", "load_time"]
 
 tracking:
-  enabled: ["wandb"]              # logs each model@runtime as its own W&B run
+  enabled: ["wandb", "tensorboard"]   # per-model W&B runs + local TensorBoard
   wandb_project: triplequant-bench
-  # set WANDB_API_KEY (or `wandb login`) to activate; otherwise auto-skipped
+  # set WANDB_API_KEY (or `wandb login`) to activate W&B; otherwise auto-skipped.
+  # TensorBoard logs to results/<run_name>/tensorboard/  (tensorboard --logdir there)
 
 datasets:
   ppl_dataset: wikitext          # NOTE: ppl is HF-only (vLLM hides logits) → auto-skipped on vllm
@@ -36,6 +37,9 @@ latency:
   output_lens:  [128, 512, 1024, 4096]
   num_requests: 20
   warmup_requests: 3
+  # Context lengths for the KV-memory sweep (must exceed ring_capacity=256 to show
+  # TurboQuant compression). The sweep stops at the first OOM.
+  ctx_sweep: [512, 1024, 2048, 4096, 8192, 16384]
 
 models:
   - name: qwen3-1.7b-fp16-baseline

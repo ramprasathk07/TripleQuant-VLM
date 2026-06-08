@@ -75,41 +75,36 @@ class RingBuffer:
     def write(
         self, key: torch.Tensor, value: torch.Tensor, num_tokens: int
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Append tokens. Returns (overflow_k, overflow_v) if buffer overflows, else None.
+        """Append tokens, keeping the most recent ``capacity`` exact (sliding window).
 
-        key/value shapes: (num_tokens, num_kv_heads, head_dim)
+        Returns (overflow_k, overflow_v) — the OLDEST tokens evicted to make room —
+        or None if everything still fits. key/value: (num_tokens, num_kv_heads, head_dim).
+
+        This is a true sliding window: at all times the ring holds the most recent
+        tokens. Only the oldest tokens spill to the compressed store. (The previous
+        implementation flushed the entire ring on overflow, which left recent context
+        compressed and wrecked decode quality — the "sawtooth" bug.)
         """
-        space = self.capacity - self._pos
-        overflow_k_parts = []
-        overflow_v_parts = []
-
-        offset = 0
-        remaining = num_tokens
-
-        while remaining > 0:
-            space = self.capacity - self._pos
-            if space <= 0:
-                # Buffer is full — drain it
-                overflow_k_parts.append(self._k[: self._pos].clone())
-                overflow_v_parts.append(self._v[: self._pos].clone())
-                self._pos = 0
-                space = self.capacity
-
-            n = min(remaining, space)
-            self._k[self._pos : self._pos + n] = key[offset : offset + n]
-            self._v[self._pos : self._pos + n] = value[offset : offset + n]
-            self._pos += n
-            offset += n
-            remaining -= n
-
+        key, value = key[:num_tokens], value[:num_tokens]
         self._total_written += num_tokens
 
-        if overflow_k_parts:
-            return (
-                torch.cat(overflow_k_parts, dim=0),
-                torch.cat(overflow_v_parts, dim=0),
-            )
-        return None
+        # Fast path: fits without eviction.
+        if self._pos + num_tokens <= self.capacity:
+            self._k[self._pos:self._pos + num_tokens] = key
+            self._v[self._pos:self._pos + num_tokens] = value
+            self._pos += num_tokens
+            return None
+
+        # Eviction: combine resident + new, keep the last `capacity`, spill the oldest.
+        combined_k = torch.cat([self._k[:self._pos], key], dim=0)
+        combined_v = torch.cat([self._v[:self._pos], value], dim=0)
+        evict = combined_k.shape[0] - self.capacity
+        overflow_k = combined_k[:evict].clone()
+        overflow_v = combined_v[:evict].clone()
+        self._k.copy_(combined_k[evict:])
+        self._v.copy_(combined_v[evict:])
+        self._pos = self.capacity
+        return overflow_k, overflow_v
 
     def drain(self) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Return all buffered tokens and reset. Returns None if empty."""

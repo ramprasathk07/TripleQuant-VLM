@@ -156,7 +156,7 @@ def generate(
     new_ids  = output_ids[0][input_len:]
     response = tokenizer.decode(new_ids, skip_special_tokens=True)
     n_tok    = len(new_ids)
-    print(f"   ⏱  {n_tok} tokens / {elapsed:.2f}s  ({n_tok / elapsed:.1f} tok/s)  VRAM: {vram_usage()}")
+    print(f"   [Perf] {n_tok} tokens / {elapsed:.2f}s  ({n_tok / elapsed:.1f} tok/s)  VRAM: {vram_usage()}")
     return response
 
 
@@ -177,7 +177,7 @@ def run_test_prompts(
     tokenizer: AutoTokenizer,
     max_new_tokens: int = 200,
 ) -> None:
-    sep = "─" * 70
+    sep = "-" * 70
     print(f"\n{sep}\n  TEST PROMPTS\n{sep}")
     for i, prompt in enumerate(_TEST_PROMPTS, 1):
         print(f"\n[{i}/{len(_TEST_PROMPTS)}] {prompt}")
@@ -197,10 +197,10 @@ def run_comparison(
         "Explain quantization in one paragraph.",
         "Write a haiku about artificial intelligence.",
     ]
-    sep = "─" * 70
-    print(f"\n{sep}\n📏  BASELINE COMPARISON\n{sep}")
+    sep = "-" * 70
+    print(f"\n{sep}\n  BASELINE COMPARISON\n{sep}")
     for prompt in prompts:
-        print(f"\n» {prompt}")
+        print(f"\n> {prompt}")
         print("  [Quantized] ", end="", flush=True)
         r_q = generate(model, tokenizer, prompt, max_new_tokens=max_new_tokens)
         print(f"  {r_q}")
@@ -215,8 +215,8 @@ def run_interactive(
     tokenizer: AutoTokenizer,
     max_new_tokens: int = 200,
 ) -> None:
-    sep = "─" * 70
-    print(f"\n{sep}\n💬  INTERACTIVE  (type 'exit' to quit)\n{sep}")
+    sep = "-" * 70
+    print(f"\n{sep}\n  INTERACTIVE  (type 'exit' to quit)\n{sep}")
     while True:
         try:
             prompt = input("\nYou: ").strip()

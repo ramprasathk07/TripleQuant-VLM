@@ -39,7 +39,15 @@ class WandBLogger:
             raise ValueError("Project name must be provided or set in .env as WANDB_PROJECT")
         
         self.entity = entity or os.getenv("WANDB_ENTITY")
-        # entity can be None - WandB will use default
+        # Ignore an unset/placeholder entity (e.g. the .env scaffold value) so wandb
+        # falls back to the API key's default account instead of erroring with
+        # "entity ... not found during upsertBucket". wandb.init also reads
+        # WANDB_ENTITY from the environment, so the placeholder must be cleared there
+        # too — otherwise passing entity=None still picks up the bad value.
+        if self.entity and ("your_" in self.entity or "username_or_team" in self.entity
+                            or not self.entity.strip()):
+            self.entity = None
+            os.environ.pop("WANDB_ENTITY", None)
         
         self.log_gpu_interval = log_gpu_interval
         self.track_gpu = track_gpu
