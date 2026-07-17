@@ -287,6 +287,7 @@ class HFRuntime(RuntimeBase):
 
         self._is_vlm:    bool          = False
         self._model_id:  str           = ""
+        self._model_vram_mb: float     = 0.0    # resident weights memory after load
         self._tq_cfg                   = None   # CacheConfig when TurboQuant enabled
         self._device:    torch.device  = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -362,11 +363,23 @@ class HFRuntime(RuntimeBase):
             self._load_causal_lm(model_id, quant_cfg, dtype, device_map, trust_rc,
                                  seq2seq=(route == "seq2seq"))
 
+        if getattr(entry, "torchao", None):
+            self._apply_torchao(entry.torchao)
         self._sanitize_generation_config()
         self._maybe_enable_turboquant(entry)
 
+        # Record resident weights memory, then reset the peak counter so the perf
+        # metrics measure INFERENCE memory rather than the transient bf16 load peak —
+        # this is what reveals weight-quantization savings (torchao int8/int4).
+        if torch.cuda.is_available():
+            self._model_vram_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+            torch.cuda.reset_peak_memory_stats()
         logger.info(f"[HFRuntime] '{model_id}' ready. "
-                    f"Peak VRAM so far: {self.peak_vram_mb():.1f} MB")
+                    f"Resident weights VRAM: {self._model_vram_mb:.1f} MB")
+
+    def model_vram_mb(self) -> float:
+        """Resident GPU memory (MB) held by the loaded model right after load/quant."""
+        return self._model_vram_mb
 
     @staticmethod
     def _resolve_load_route(model_class: str, is_vlm: bool) -> str:
@@ -383,6 +396,33 @@ class HFRuntime(RuntimeBase):
         if model_class in explicit:
             return explicit[model_class]
         return "vlm" if is_vlm else "lm"     # model_class == "auto"
+
+    def _apply_torchao(self, scheme: str) -> None:
+        """Apply torchao on-the-fly weight quantization in place (HF runtime).
+
+        A second quantization backend to compare against llm_compressor/modelopt and
+        TurboQuant. Weight-only int8/int4 and dynamic int8; fp8 weight-only on Ada/
+        Hopper. int4/fp8 need a kernel that may be unavailable on older torch/GPU —
+        those raise and the benchmark records a load error (crash-safe).
+        """
+        from torchao.quantization import (
+            quantize_, Int4WeightOnlyConfig, Int8WeightOnlyConfig,
+            Int8DynamicActivationInt8WeightConfig,
+        )
+        configs = {
+            "int8wo": lambda: Int8WeightOnlyConfig(),
+            "int8dq": lambda: Int8DynamicActivationInt8WeightConfig(),
+            "int4wo": lambda: Int4WeightOnlyConfig(group_size=128),
+        }
+        try:
+            from torchao.quantization import Float8WeightOnlyConfig
+            configs["fp8wo"] = lambda: Float8WeightOnlyConfig()
+        except Exception:
+            pass
+        if scheme not in configs:
+            raise ValueError(f"Unknown torchao scheme '{scheme}'. Choose: {list(configs)}")
+        quantize_(self.model, configs[scheme]())
+        logger.info("[HFRuntime] torchao '%s' applied.", scheme)
 
     def _maybe_enable_turboquant(self, entry: "BenchmarkModelEntry") -> None:
         """Patch attention + arm a TurboQuant cache when enabled for this entry."""

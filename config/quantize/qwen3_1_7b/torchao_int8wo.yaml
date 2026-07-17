@@ -1,0 +1,26 @@
+# Qwen3-1.7B · torchao · INT8 weight-only (W8A16)
+# torchao weight-only quant applied directly via quantize_(); reloads with from_pretrained
+# in an environment that has torchao installed (safe_serialization=False).
+method: ptq
+backend: torchao
+
+model:
+  model_id: Qwen/Qwen3-1.7B
+  torch_dtype: bfloat16
+  device_map: auto
+  model_type: llm
+
+scheme:
+  scheme: W8A16          # -> int8_weight_only. W4A16 -> int4 (needs newer torch/GPU)
+  group_size: 128
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:             # required by schema; torchao weight-only ignores it
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  num_samples: 8
+
+output:
+  output_dir: ./outputs/qwen3-1.7b/torchao-int8wo
+  save_compressed: false
+  save_processor: false

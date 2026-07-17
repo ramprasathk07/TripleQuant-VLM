@@ -256,7 +256,7 @@ _FLOAT_SCHEMES: set[str] = {
 # Schemes llm_compressor cannot build — route to backend=modelopt.
 _MODELOPT_ONLY_SCHEMES: set[str] = {"FP8_BLOCK", "MXFP4"}
 
-BackendLiteral = Literal["llm_compressor", "modelopt"]
+BackendLiteral = Literal["llm_compressor", "modelopt", "torchao"]
 
 
 class QuantizeConfig(BaseModel):
@@ -501,6 +501,7 @@ class BenchmarkModelEntry(BaseModel):
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1             # vLLM multi-GPU
     hf_quantization: Optional[str] = None     # HF on-the-fly BnB: None | 'int8' | 'int4' | 'nf4'
+    torchao: Optional[Literal["int4wo", "int8wo", "int8dq", "fp8wo"]] = None  # torchao on-the-fly quant (HF only)
     model_class: ModelClassLiteral = "auto"   # which transformers Auto* class to load with
 
     # ── TurboQuant KV-cache (HF runtime only) ──

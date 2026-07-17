@@ -49,6 +49,15 @@ models:
     model_class: causal_lm        # explicit; "auto" would also pick causal_lm
     dtype: bfloat16
 
+  - name: qwen3-1.7b-torchao-int8wo
+    path: Qwen/Qwen3-1.7B
+    is_local: false
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    torchao: int8wo               # torchao weight-only int8 (compare vs fp16 / TQ)
+    # int4wo / fp8wo need newer torch / Ada+ GPU — they error gracefully on this box.
+
   - name: qwen3-1.7b-turboquant-k3v2
     path: Qwen/Qwen3-1.7B
     is_local: false

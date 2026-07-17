@@ -38,6 +38,17 @@ def get_quantizer(config: QuantizeConfig) -> BaseQuantizer:
             ) from e
         logger.info("Creating ModelOptQuantizer")
         return ModelOptQuantizer(config)
+    elif config.backend == "torchao":
+        try:
+            from .torch_ao import TorchAOQuantizer
+        except ImportError as e:
+            raise ImportError(
+                "torchao is required for backend='torchao'.\n"
+                "Install: pip install torchao\n"
+                f"Original error: {e}"
+            ) from e
+        logger.info("Creating TorchAOQuantizer")
+        return TorchAOQuantizer(config)
     else:
         raise ValueError(f"Unsupported backend: {config.backend}. "
-                         f"Choose 'llm_compressor' or 'modelopt'.")
+                         f"Choose 'llm_compressor', 'modelopt', or 'torchao'.")

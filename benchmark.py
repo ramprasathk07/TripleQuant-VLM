@@ -286,6 +286,8 @@ def _run_memory(runtime, entry: BenchmarkModelEntry,
         out["disk_mb"] = _dir_size_mb(Path(entry.path))
     if "vram" in wanted:
         out["peak_vram_mb"] = round(runtime.peak_vram_mb(), 2)
+        if hasattr(runtime, "model_vram_mb"):
+            out["model_vram_mb"] = round(runtime.model_vram_mb(), 2)   # resident weights
     if "load_time" in wanted:
         out["load_time_s"] = round(load_time_s, 2)
 
@@ -439,7 +441,7 @@ def _curated_scalars(metrics: dict) -> dict:
 
     mem = metrics.get("memory", {})
     if isinstance(mem, dict):
-        for k in ("peak_vram_mb", "disk_mb", "load_time_s"):
+        for k in ("peak_vram_mb", "model_vram_mb", "disk_mb", "load_time_s"):
             if isinstance(mem.get(k), num):
                 out[f"memory/{k}"] = mem[k]
 
