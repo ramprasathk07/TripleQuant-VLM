@@ -38,6 +38,9 @@ logger = setup_global_logging("benchmark")
 
 from src.config import load_benchmark_config
 from src.config.schemas import BenchmarkConfig, BenchmarkModelEntry
+from src.reporting.extract import (
+    bits_grid, ctx_rows, curated_scalars, flatten_metrics, tput_rows,
+)
 
 # Fixed prompt used for latency / throughput profiling.
 _PERF_PROMPT = "Explain the theory of relativity in simple terms, step by step."
@@ -362,37 +365,6 @@ def _run_model_on_runtime(
 
 
 # ── Weights & Biases tracking ────────────────────────────────────────────────
-def _flatten_metrics(metrics: dict, prefix: str = "") -> dict:
-    """Flatten a nested benchmark metrics dict into scalar `key -> number` pairs.
-
-    - dicts recurse with a "/"-joined prefix;
-    - a throughput list (items with `batch_size`) expands to `.../bs{n}/...`;
-    - booleans become 0/1; non-numeric values (strings, None, error/oom markers)
-      are dropped so only loggable scalars remain.
-    """
-    out: dict = {}
-    for key, val in metrics.items():
-        if key in ("per_sample", "error", "detail"):
-            continue
-        full = f"{prefix}{key}"
-        if isinstance(val, bool):
-            out[full] = int(val)
-        elif isinstance(val, (int, float)):
-            out[full] = val
-        elif isinstance(val, dict):
-            out.update(_flatten_metrics(val, prefix=f"{full}/"))
-        elif isinstance(val, list) and val and isinstance(val[0], dict):
-            for item in val:
-                tag = f"bs{item['batch_size']}" if "batch_size" in item else None
-                if tag is None:
-                    continue
-                out.update(_flatten_metrics(
-                    {k: v for k, v in item.items() if k != "batch_size"},
-                    prefix=f"{full}/{tag}/",
-                ))
-    return out
-
-
 def _init_wandb(config: BenchmarkConfig):
     """Build a WandBLogger if W&B tracking is enabled and importable, else None.
 
@@ -432,83 +404,12 @@ def _init_wandb(config: BenchmarkConfig):
         return None
 
 
-def _curated_scalars(metrics: dict) -> dict:
-    """Headline perf / memory / quality scalars to log as comparison panels.
-
-    A curated subset (not every nested value) so the W&B workspace shows clean,
-    cross-run bar panels instead of dozens of single-point charts.
-    """
-    out: dict = {}
-    num = (int, float)
-
-    mem = metrics.get("memory", {})
-    if isinstance(mem, dict):
-        for k in ("peak_vram_mb", "model_vram_mb", "disk_mb", "load_time_s"):
-            if isinstance(mem.get(k), num):
-                out[f"memory/{k}"] = mem[k]
-
-    perf = metrics.get("perf", {})
-    if isinstance(perf, dict):
-        lat = perf.get("latency", {})
-        if isinstance(lat, dict):
-            for k in ("ttft_ms_p50", "ttft_ms_p99", "tpot_ms_p50", "tpot_ms_p99"):
-                if isinstance(lat.get(k), num):
-                    out[f"latency/{k}"] = lat[k]
-        tps = [r.get("tokens_per_sec", 0) for r in _tput_rows(metrics)]
-        if tps:
-            out["throughput/best_tokens_per_sec"] = max(tps)
-        mc = perf.get("max_context", {})
-        if isinstance(mc, dict):
-            for k in ("measured_max_tokens", "model_max_positions"):
-                if isinstance(mc.get(k), num):
-                    out[f"max_context/{k}"] = mc[k]
-        cs = perf.get("ctx_sweep", {})
-        if isinstance(cs, dict) and isinstance(cs.get("est_max_ctx_tokens"), num):
-            out["max_context/est_max_ctx_tokens"] = cs["est_max_ctx_tokens"]
-
-    q = metrics.get("quality_llm", {})
-    if isinstance(q, dict):
-        if isinstance(q.get("ppl"), num):
-            out["quality/ppl"] = q["ppl"]
-        if isinstance(q.get("mmlu_acc"), num):
-            out["quality/mmlu_acc"] = q["mmlu_acc"]
-        for name in ("gsm8k", "aime", "ceval"):
-            v = q.get(name)
-            if isinstance(v, dict) and isinstance(v.get("acc"), num):
-                out[f"quality/{name}_acc"] = v["acc"]
-    qo = metrics.get("quality_ocr", {})
-    if isinstance(qo, dict):
-        for k in ("cer", "wer", "exact_match", "bleu"):
-            if isinstance(qo.get(k), num):
-                out[f"quality/{k}"] = qo[k]
-    return out
-
-
-def _ctx_rows(metrics: dict) -> list:
-    """Series points that are a genuine fit — excludes the point (if any) where
-    WDDM paged into shared system memory (oversubscribed=True); that point stays
-    in the raw JSON for transparency but isn't a real capacity result."""
-    sweep = metrics.get("perf", {}).get("ctx_sweep", {})
-    series = sweep.get("series", []) if isinstance(sweep, dict) else []
-    return [s for s in series if s.get("fits") and not s.get("oversubscribed")]
-
-
-def _bits_grid(metrics: dict) -> list:
-    sweep = metrics.get("perf", {}).get("tq_bits_sweep", {})
-    return sweep.get("grid", []) if isinstance(sweep, dict) else []
-
-
-def _tput_rows(metrics: dict) -> list:
-    tput = metrics.get("perf", {}).get("throughput", [])
-    return [r for r in tput if isinstance(r, dict) and not r.get("oom")] if isinstance(tput, list) else []
-
-
 def _log_wandb_charts(run, metrics: dict) -> None:
     """Log the curated W&B charts: context sweep, TQ bits sweep, throughput."""
     import wandb
     panels: dict = {}
 
-    rows = _ctx_rows(metrics)
+    rows = ctx_rows(metrics)
     if rows:
         lens = [r["context_len"] for r in rows]
         panels["ctx_sweep/kv_cache_mb_vs_len"] = wandb.plot.line_series(
@@ -525,7 +426,7 @@ def _log_wandb_charts(run, metrics: dict) -> None:
             ctx_table, "context_len", "peak_vram_mb", title="Peak VRAM (MB) vs context length")
         panels["ctx_sweep/table"] = ctx_table
 
-    grid = _bits_grid(metrics)
+    grid = bits_grid(metrics)
     if grid:
         lengths = sorted({g["context_len"] for g in grid})
         bits = sorted({g["bits"] for g in grid})
@@ -554,7 +455,7 @@ def _log_wandb_charts(run, metrics: dict) -> None:
             data=[[g["bits"], g["context_len"], g["top1_agreement"], g.get("top5_agreement"),
                    g.get("kl_div"), g.get("kv_cache_mb"), g.get("compression_ratio")] for g in grid])
 
-    tput = _tput_rows(metrics)
+    tput = tput_rows(metrics)
     if tput:
         tp_table = wandb.Table(
             columns=["batch_size", "tokens_per_sec", "latency_ms", "turboquant"],
@@ -594,8 +495,8 @@ def _log_record_to_wandb(tracker, record: dict, entry: BenchmarkModelEntry,
         if run is not None:
             m = record.get("metrics", {})
             # Curated headline scalars as comparison panels; full set in summary.
-            run.log(_curated_scalars(m))
-            run.summary.update(_flatten_metrics(m))
+            run.log(curated_scalars(m))
+            run.summary.update(flatten_metrics(m))
             run.summary["status"] = record.get("status")
             _log_wandb_charts(run, m)
         tracker.finish_current_run()
@@ -614,19 +515,19 @@ def _log_record_to_tensorboard(tb_dir: Path, tag: str, record: dict) -> None:
     try:
         w = SummaryWriter(log_dir=str(tb_dir / safe))
         m = record.get("metrics", {})
-        for k, v in _flatten_metrics(m).items():
+        for k, v in flatten_metrics(m).items():
             w.add_scalar(k, v)
-        for s in _ctx_rows(m):
+        for s in ctx_rows(m):
             L = s["context_len"]
             w.add_scalar("ctx_sweep/kv_cache_mb", s["kv_cache_mb"], L)
             w.add_scalar("ctx_sweep/peak_vram_mb", s["peak_vram_mb"], L)
             w.add_scalar("ctx_sweep/compression_ratio", s.get("compression_ratio", 1.0), L)
-        for g in _bits_grid(m):
+        for g in bits_grid(m):
             L, b = g["context_len"], g["bits"]
             w.add_scalar(f"tq_bits_top1/{b}", g["top1_agreement"], L)
             w.add_scalar(f"tq_bits_top5/{b}", g.get("top5_agreement", 0.0), L)
             w.add_scalar(f"tq_bits_kv_mb/{b}", g.get("kv_cache_mb", 0.0), L)
-        for r in _tput_rows(m):
+        for r in tput_rows(m):
             w.add_scalar("throughput/tokens_per_sec", r["tokens_per_sec"], r["batch_size"])
         w.close()
     except Exception as exc:
