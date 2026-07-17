@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import platform
+import subprocess
 import sys
 import time
 import traceback
@@ -483,9 +485,12 @@ def _curated_scalars(metrics: dict) -> dict:
 
 
 def _ctx_rows(metrics: dict) -> list:
+    """Series points that are a genuine fit — excludes the point (if any) where
+    WDDM paged into shared system memory (oversubscribed=True); that point stays
+    in the raw JSON for transparency but isn't a real capacity result."""
     sweep = metrics.get("perf", {}).get("ctx_sweep", {})
     series = sweep.get("series", []) if isinstance(sweep, dict) else []
-    return [s for s in series if s.get("fits")]
+    return [s for s in series if s.get("fits") and not s.get("oversubscribed")]
 
 
 def _bits_grid(metrics: dict) -> list:
@@ -629,7 +634,8 @@ def _log_record_to_tensorboard(tb_dir: Path, tag: str, record: dict) -> None:
 
 
 # Summary
-def _build_comparison_summary(all_results: dict) -> dict:
+def _build_comparison_summary(all_results: dict, environment: dict | None = None,
+                              run_name: str | None = None) -> dict:
     """Reshape flat benchmark results into a comparison table.
 
     Flattens per-(model, runtime) result records, extracting key metrics
@@ -639,10 +645,14 @@ def _build_comparison_summary(all_results: dict) -> dict:
     Args:
         all_results: Dict mapping result keys (e.g., "modelA@hf") to full
                      result records from _run_model_on_runtime().
+        environment: Optional hardware/software snapshot from _capture_environment().
+        run_name:    Optional BenchmarkConfig.run_name, for provenance.
 
     Returns:
         Dict with keys:
           - timestamp: ISO datetime of benchmark run start
+          - run_name: the benchmark config's run_name (or None)
+          - environment: GPU/CUDA/driver/torch/transformers/commit snapshot (or None)
           - num_records: count of result rows
           - records: list of dicts (one per model-runtime pair) with columns
                      [model, runtime, status, ttft_ms_p50, tpot_ms_p50, best_tps,
@@ -679,6 +689,8 @@ def _build_comparison_summary(all_results: dict) -> dict:
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_name": run_name,
+        "environment": environment,
         "num_records": len(rows),
         "records": rows,
     }
@@ -785,6 +797,11 @@ def main() -> None:
     all_results: dict[str, dict] = {}
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     arch = _detect_arch()
+    environment = _capture_environment()
+    logger.info("  Environment: gpu=%s driver=%s cuda=%s torch=%s commit=%s",
+                environment.get("gpu_name"), environment.get("gpu_driver_version"),
+                environment.get("cuda_version"), environment.get("torch_version"),
+                environment.get("git_commit"))
     tracker = _init_wandb(config)
     if tracker is not None:
         logger.info("W&B tracking on -> project '%s'", config.tracking.wandb_project)
@@ -808,6 +825,7 @@ def main() -> None:
                 "model_name": entry.name, "model_path": entry.path,
                 "model_type": entry.model_type, "runtime": "—",
                 "status": "skipped", "timestamp": run_ts,
+                "environment": environment,
                 "metrics": {"skipped": "local checkpoint not found"},
             }
             continue
@@ -843,6 +861,7 @@ def main() -> None:
                 "runtime":    runtime_name,
                 "status":     status,
                 "timestamp":  run_ts,
+                "environment": environment,
                 "metrics":    metrics,
             }
             all_results[tag] = record
@@ -856,7 +875,7 @@ def main() -> None:
             if tb_dir is not None:
                 _log_record_to_tensorboard(tb_dir, f"{entry.name}@{runtime_name}", record)
 
-    summary = _build_comparison_summary(all_results)
+    summary = _build_comparison_summary(all_results, environment, config.run_name)
     summary_path = results_dir / f"comparison_summary_{run_ts}.json"
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, default=str)
@@ -880,6 +899,64 @@ def _detect_arch() -> str:
         return get_gpu_arch()
     except Exception:
         return ""
+
+
+def _git_commit() -> str | None:
+    """Short git commit hash of the checkout running this benchmark, or None."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _nvidia_driver_version() -> str | None:
+    """Driver version via nvidia-smi, or None (non-NVIDIA / not installed)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip().splitlines()[0] if out.returncode == 0 and out.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def _capture_environment() -> dict:
+    """Snapshot the hardware/software environment once per benchmark run.
+
+    Reproducibility record (GPU, CUDA, driver, torch/transformers, commit) so a
+    results JSON is self-describing without cross-referencing when/where it ran.
+    Every field is best-effort; a failed lookup is None rather than aborting the run.
+    """
+    env: dict = {
+        "python_version": platform.python_version(),
+        "os": platform.platform(),
+        "git_commit": _git_commit(),
+    }
+    try:
+        import torch
+        env["torch_version"] = torch.__version__
+        env["cuda_version"] = torch.version.cuda
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            env["gpu_name"] = props.name
+            env["gpu_total_vram_mb"] = round(props.total_memory / (1024 ** 2), 1)
+            env["gpu_driver_version"] = _nvidia_driver_version()
+        else:
+            env["gpu_name"] = None
+    except Exception as exc:
+        logger.warning("Environment capture: torch/cuda info incomplete: %s", exc)
+    try:
+        import transformers
+        env["transformers_version"] = transformers.__version__
+    except Exception:
+        env["transformers_version"] = None
+    return env
 
 
 if __name__ == "__main__":
