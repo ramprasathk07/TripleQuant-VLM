@@ -20,11 +20,9 @@ dependencies = [
     "transformers>=4.46.0",
     "accelerate>=0.33.0",
 
-    # Quantization
+    # Quantization (llmcompressor is the always-available backend; modelopt and
+    # torchao are optional extras below — see README "Execution Backends")
     "llmcompressor>=0.4.0",
-
-    # Inference / benchmarking
-    "vllm>=0.5.0",
 
     # Datasets
     "datasets>=2.20.0",
@@ -41,6 +39,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# vLLM's own dependency pins routinely conflict with the quantization stack's
+# torch/transformers pins (see README "Environment Separation Note") -- keep it
+# an opt-in extra, installed into its own venv, not a hard base dependency.
+vllm = [
+    "vllm>=0.10,<0.12",
+]
+modelopt = [
+    "nvidia-modelopt[torch]>=0.44.0",
+]
+torchao = [
+    "torchao>=0.17.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov",
