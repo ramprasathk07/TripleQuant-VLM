@@ -1,0 +1,183 @@
+# Failure Cases & Known Limitations
+
+Honest documentation of what doesn't work, what's slower than it should be, and what
+looked broken but wasn't. Each entry: symptom, root cause, fix or current status,
+evidence. Kept up to date as the project moves — an entry closed by a fix stays here
+with its resolution, not deleted, so the debugging trail survives.
+
+---
+
+## 1. Windows WDDM silently oversubscribes VRAM (fixed 2026-07-17)
+
+**Symptom:** `measure_ctx_sweep`/`measure_max_context` (`src/runtimes/hf/hf_runtime.py`)
+reported `peak_vram_mb: 14174` with `fits: true` at 8192-token context, on a 12288 MB
+RTX 3060. Physically impossible for a real CUDA allocation.
+
+**Root cause:** on Windows with the WDDM driver model, a CUDA allocation that exceeds
+dedicated VRAM can silently spill into shared system RAM instead of raising
+`OutOfMemoryError`. `torch.cuda.max_memory_allocated()` faithfully reports what the
+allocator believes it allocated — which can exceed the card's physical memory — while
+the forward pass "succeeds," just at PCIe-transfer speed instead of VRAM bandwidth. Any
+benchmark that treats "no exception" as "it fits" inherits this lie.
+
+**Fix:** compare peak allocated against `torch.cuda.get_device_properties().total_memory`
+(a static hardware fact WDDM's paging can't inflate). Anything past 95% of it is flagged
+`oversubscribed: true`, excluded from `max_fit_tokens`, and the sweep stops there rather
+than continuing into increasingly-fake territory. Commit `2289023`.
+
+**Evidence:** re-running the same probe after the fix converges `measure_max_context` on
+Qwen3-1.7B/RTX3060 to 6912 tokens instead of continuing past the physical boundary.
+`docs/benchmark_report.md`'s context-length chart is built entirely on the corrected
+measurement.
+
+**Takeaway for anyone benchmarking on Windows:** don't trust a "fits" signal from exception
+absence alone. Cross-check against `torch.cuda.get_device_properties().total_memory`.
+
+---
+
+## 2. TurboQuant's default K3V2 has weak next-token agreement at low bit-widths
+
+**Symptom:** measured next-token agreement with the FP16 baseline (at the compressed-tail
+KV positions, i.e. tokens old enough to have left the exact ring buffer): K2V2 and K3V2
+both score 9-19% across context lengths 512-4096. That's barely above what a large-vocab
+model would score by chance on a hard prompt.
+
+**Root cause:** the key quantizer treats each key vector independently with a single
+global codebook and no per-channel outlier handling. Transformer key vectors have a small
+number of large-magnitude *channels* (this is the same outlier-channel phenomenon
+SmoothQuant/AWQ correct for in weights) — a uniform per-vector codebook wastes bits on
+channels that don't need precision and starves the channels that do. Value vectors don't
+have this pathology as severely, which is why V4 recovers much more agreement than K3->K4
+does at matched total bits (see the table in `docs/benchmark_report.md`: K2V2 vs K3V2
+score within noise of each other — both are V2 — while K4V4 is a clear step up).
+
+**Status: not fixed, understood.** The real fix is per-channel key quantization (KIVI's
+approach: quantize keys per-channel, values per-token) — a quantizer redesign, not a
+wiring bug. Verified via the identity test in
+[`debugging_turboquant_kv.md`](engineering_notes.md): round-trip
+`dequantize(quantize(x))` error falls monotonically with bit-width (K3 0.43 -> K4 0.23 ->
+K8 0.02 relative error) — a *correct* codec operating at a tight, uneven budget, not a
+bug. A clean K8/V8 generation run (fully coherent output) rules out an integration bug by
+construction: if the wiring were broken, high bits wouldn't fix it either.
+
+**Mitigation today:** the pipeline ships the full bit-width sweep rather than hiding it —
+`docs/benchmark_report.md`'s tradeoff table lets you pick the point on the curve that
+matches your quality bar. K8V8 is near-lossless (~97-98% agreement) at a modest 1.3-1.7x
+compression; K3V2 trades quality for a much larger compression ratio (up to 4.07x at
+context 4096) and a 4x context-length win (see `docs/benchmark_report.md`'s headline
+result) — whether that trade is worth it is workload-dependent, which is the point of
+measuring and reporting it rather than picking a "best" default and hiding the rest.
+
+---
+
+## 3. QJL 1-bit residual correction doesn't help in practice
+
+**Symptom:** the QJL correction (`src/turboquant_v1/quantize.py`) is designed to make the
+inner-product estimate unbiased, but empirically degrades generation quality compared to
+MSE-only quantization at the same bit budget.
+
+**Root cause, precisely:** the QJL-corrected estimator and dequantize-then-matmul are
+**algebraically identical** for a fixed random projection `S` —
+`q @ (k_mse + x_qjl).T == (q @ k_mse.T) + (q @ S.T) @ signs.T * scale`. QJL's theoretical
+benefit is variance reduction *in expectation over random `S`*, not a per-call accuracy
+gain for one fixed draw of `S`. In this implementation `S` is fixed once at init (for
+speed — resampling per call would cost more than it's worth), so the theoretical benefit
+never materializes, and the extra 1-bit-per-coordinate storage buys nothing.
+
+**Status:** MSE-only ships as the default (`use_qjl: false`); QJL is exposed via
+`--use-qjl` for experimentation, not recommended. Documented in the README's TurboQuant
+section and re-derived independently in
+[`debugging_turboquant_kv.md`](engineering_notes.md) Case in Phase 3.2 — a fix hypothesis
+that looked plausible, was measured numerically before being built, and turned out to be
+a dead end. Kept as a worked example of testing a fix's premise before implementing it.
+
+---
+
+## 4. Teacher-forced perplexity cannot see KV-cache quantization error
+
+**Symptom:** early benchmark sweeps (through 2026-06-08) showed TurboQuant's PPL and
+MMLU-tiny scores as *bit-identical* to the FP16 baseline — `22.449370186003648` to 16
+decimal places. That's not "no quality loss," it's the metric being blind.
+
+**Root cause:** perplexity evaluation is teacher-forced — every ground-truth token is fed
+back into the model as input for the next position, computed in a single forward pass over
+the whole sequence. The KV cache is populated and never *read back* for anything the loss
+depends on (each position's logits only need the causal-masked prefix, materialized fresh
+each time in one pass). TurboQuant compresses the *cache*; a metric that never exercises
+cache reads structurally cannot detect cache compression error, regardless of how lossy
+the codec is.
+
+**Fix:** measure quality via actual **generation** — multi-step decode, where each new
+token's attention genuinely reads back the (possibly compressed) cache from previous
+steps. `measure_bits_accuracy` / the `tq_bits_sweep` metric
+(`src/runtimes/hf/hf_runtime.py`) does exactly this: forward passes with
+`past_key_values` populated, comparing next-token logits against a cache-free FP16
+reference on the same input.
+
+**Takeaway for anyone evaluating KV-cache compression:** if your quality metric doesn't
+change when you swap the KV-cache codec, check whether the metric ever reads the cache
+before concluding the codec is lossless. This is general to any KV-cache technique (FP8
+KV, KIVI, TurboQuant, ...), not specific to this implementation.
+
+---
+
+## 5. FP8 is emulated (slow) on Ampere
+
+**Symptom:** FP8 quantization schemes (`FP8`, `FP8_DYNAMIC`) load and run on the RTX 3060,
+but with a real performance penalty compared to native FP8 hardware.
+
+**Root cause:** FP8 E4M3/E5M2 Tensor Core acceleration is Ada Lovelace/Hopper+ only.
+Ampere (RTX 30-series, A100) has no native FP8 matrix path — vLLM and torch fall back to
+emulated dequant-then-compute, which works correctly but forfeits the format's speed
+advantage entirely; the only benefit retained on Ampere is the smaller checkpoint/VRAM
+footprint, not throughput.
+
+**Status:** documented hardware floor, not a bug. See the README's Hardware Compatibility
+Floors table. Confirmed correct but slow in practice on this project's dev hardware.
+
+---
+
+## 6. NVIDIA ModelOpt's CUDA extension won't JIT on Windows (no MSVC `cl.exe`)
+
+**Symptom:** ModelOpt-backed AWQ quantization runs correctly but falls back to a slow CPU
+extension path on Windows dev boxes.
+
+**Root cause:** `modelopt_cuda_ext` JIT-compiles a CUDA extension at import time via
+`torch.utils.cpp_extension`, which shells out to an MSVC `cl.exe` host compiler. Without
+Visual Studio C++ Build Tools installed, the JIT silently falls back to a pure-Python/CPU
+implementation of the same op — correct output, much slower calibration.
+
+**Fix:** install VS C++ Build Tools to enable the fast path. Left undone in this dev
+environment (calibration still completes, just slower) — flagged here so it isn't
+mistaken for a correctness problem if someone sees a slow AWQ run on Windows.
+
+---
+
+## 7. vLLM needs a separate environment from the quantization stack
+
+**Symptom:** installing `vllm` alongside `llmcompressor`/`modelopt`/`torch` in one
+environment routinely produces dependency conflicts (see the README's "Environment
+Separation Note").
+
+**Root cause:** vLLM pins its own compatible torch/transformers/CUDA range, which drifts
+out of sync with the quantization backends' pins on a different release cadence. Both
+ecosystems move fast enough that a single shared environment breaks intermittently.
+
+**Fix:** documented split — quantize and run HF-runtime evaluation in the primary
+environment; run the vLLM runtime in a separate, clean environment
+(`pip install -e ".[vllm]"` in its own venv, now that this is a proper optional extra
+rather than a hard dependency — see the pyproject.toml hygiene pass). Not a bug, a
+packaging-ecosystem reality; documented rather than fought.
+
+---
+
+## 8. TurboQuant's fused Triton kernels aren't built yet
+
+**Status:** the PyTorch reference path (`src/turboquant_v1/`) is what every result in this
+repo runs on — correct, but 5-10x slower than a fused decode kernel would be, per the
+kernel-scope estimate in `notes/kernel_scope.md`. The Triton kernels (MSE score, QJL
+score, fused decode) are scoped and designed (math + pseudocode in `notes/turboquant.md`
+§5) but not implemented. This means every TPOT/TPS number in `docs/benchmark_report.md`
+for the TurboQuant entries reflects the *unfused* reference implementation — the memory
+story (context-length capacity) is real and already measured; the latency story has more
+headroom than what's shown once/if the kernels land.
