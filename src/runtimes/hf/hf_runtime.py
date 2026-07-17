@@ -49,6 +49,14 @@ except ImportError:
 
 from ..base import RuntimeBase
 
+# On Windows/WDDM, CUDA allocations can silently spill into shared system RAM
+# instead of raising OutOfMemoryError — torch.cuda.max_memory_allocated() then
+# reports a peak *larger than the card's physical VRAM*, and a context-length
+# probe reads as "fits" when it actually paged at PCIe speed. 0.95 of the
+# hardware total (a static, driver-independent fact) is treated as the real
+# capacity ceiling; anything above it is flagged rather than trusted.
+_VRAM_OVERSUBSCRIBE_SAFETY = 0.95
+
 
 
 # Internal helpers
@@ -1093,14 +1101,25 @@ class HFRuntime(RuntimeBase):
             }
 
         vocab = int(getattr(self.model.config, "vocab_size", 32000) or 32000)
+        total_vram_mb = torch.cuda.get_device_properties(self._device).total_memory / (1024 ** 2)
 
         def _fits(length: int) -> bool:
             try:
+                torch.cuda.reset_peak_memory_stats()
                 ids = torch.randint(0, vocab, (1, length), device=self._device)
                 with torch.no_grad():
                     self.model(input_ids=ids)
+                peak_mb = self.peak_vram_mb()
                 del ids
                 torch.cuda.empty_cache()
+                if peak_mb > total_vram_mb * _VRAM_OVERSUBSCRIBE_SAFETY:
+                    # "Succeeded" only via WDDM shared-memory paging — not a real fit.
+                    logger.warning(
+                        "[max_context] length=%d peak=%.0fMB exceeds dedicated VRAM "
+                        "(%.0fMB) — treating as not-fits (shared-memory fallback).",
+                        length, peak_mb, total_vram_mb,
+                    )
+                    return False
                 return True
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
@@ -1185,6 +1204,7 @@ class HFRuntime(RuntimeBase):
         vocab = int(getattr(self.model.config, "vocab_size", 32000) or 32000)
         fp16_bpt = self._kv_bytes_per_token()
         series, max_fit = [], 0
+        total_vram_mb = torch.cuda.get_device_properties(self._device).total_memory / (1024 ** 2)
 
         for L in sorted(lengths):
             if not torch.cuda.is_available():
@@ -1202,17 +1222,31 @@ class HFRuntime(RuntimeBase):
                         self.model(input_ids=ids, use_cache=True)
                         kv_mb = (L * fp16_bpt) / (1024 ** 2)   # dense fp16 KV
                 fp16_kv_mb = (L * fp16_bpt) / (1024 ** 2)
+                peak_mb = round(self.peak_vram_mb(), 1)
+                # WDDM can silently page an allocation into shared system RAM instead
+                # of raising OOM — a peak above the card's physical VRAM means this
+                # "success" ran at PCIe speed, not a real fit. Flag it and stop; don't
+                # count it toward max_fit_tokens.
+                oversubscribed = peak_mb > total_vram_mb * _VRAM_OVERSUBSCRIBE_SAFETY
                 series.append({
                     "context_len": L,
                     "kv_cache_mb": round(kv_mb, 3),
                     "fp16_kv_mb": round(fp16_kv_mb, 3),
                     "compression_ratio": round(fp16_kv_mb / kv_mb, 2) if kv_mb else 1.0,
-                    "peak_vram_mb": round(self.peak_vram_mb(), 1),
+                    "peak_vram_mb": peak_mb,
                     "fits": True,
+                    "oversubscribed": oversubscribed,
                 })
-                max_fit = L
                 del ids, cache
                 torch.cuda.empty_cache()
+                if oversubscribed:
+                    logger.warning(
+                        "[ctx_sweep] context_len=%d peak=%.0fMB exceeds dedicated VRAM "
+                        "(%.0fMB) — shared-memory fallback, not a real fit. Stopping sweep.",
+                        L, peak_mb, total_vram_mb,
+                    )
+                    break
+                max_fit = L
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 if "out of memory" not in str(e).lower() and not isinstance(e, torch.cuda.OutOfMemoryError):
                     raise
