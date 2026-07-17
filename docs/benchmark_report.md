@@ -24,14 +24,23 @@ its advantage. **The real story is context-length capacity on a fixed 12GB card:
 | Model | Max usable context (this GPU) |
 |---|---|
 | fp16 baseline | 4,096 tokens |
-| torchao int8wo | 8,192 tokens |
+| torchao int8wo | 4,096 tokens (same bucket as fp16) |
 | **TurboQuant K3V2** | **16,384 tokens** |
 
-TurboQuant reaches **4x** fp16's usable context on identical hardware. This is measured,
-not estimated — each point is a real forward pass, and the sweep stops at the first
-length that doesn't fit (see the Windows VRAM-oversubscription note in
+TurboQuant reaches **4x** fp16/torchao's usable context on identical hardware. This is
+measured, not estimated — each point is a real forward pass, and the sweep stops at the
+first length that doesn't fit (see the Windows VRAM-oversubscription note in
 [`failure_cases.md`](failure_cases.md) for why "doesn't fit" needed a real fix before this
 number could be trusted).
+
+torchao's smaller resident-weight footprint gives it real headroom at every measured
+context length (5,324 MB vs fp16's 6,364 MB at 4,096 tokens — consistently ~1GB less
+throughout), but not enough to survive the sweep's next doubling step: both hit 8,192
+tokens over the 12,288 MB card's capacity (torchao 13,134 MB, fp16 14,174 MB). This sweep
+only tests power-of-2 lengths, so it can't resolve where between 4,096 and 8,192
+torchao's true ceiling actually sits — that would need a finer-grained sweep, not run
+here. Don't read "same bucket" as "no advantage"; read it as "the advantage exists but
+this measurement's resolution can't quantify it precisely."
 
 ![VRAM vs context length](plots/ctx_sweep.png)
 

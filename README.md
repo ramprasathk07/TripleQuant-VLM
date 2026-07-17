@@ -34,10 +34,20 @@ context can grow before the cache exhausts the GPU:**
 | Model | Max usable context, this GPU |
 |---|---|
 | fp16 baseline | 4,096 tokens |
-| torchao int8wo | 8,192 tokens |
-| **TurboQuant K3V2** | **16,384 tokens (4x fp16)** |
+| torchao int8wo | 4,096 tokens (same bucket as fp16 — see note) |
+| **TurboQuant K3V2** | **16,384 tokens (4x fp16/torchao)** |
 
 ![Peak VRAM vs context length](docs/plots/ctx_sweep.png)
+
+Note: torchao's smaller resident-weight footprint does buy real headroom at every
+matched context length (e.g. 5,324 MB vs fp16's 6,364 MB at 4,096 tokens) — it just isn't
+enough to survive the *next* doubling step in this sweep's grid (512/1024/.../16384): both
+land over the 12,288 MB card's capacity at 8,192 tokens (torchao 13,134 MB, fp16
+14,174 MB). A finer-grained sweep would likely find torchao's true ceiling somewhere
+between 4,096 and 8,192, higher than fp16's — but that hasn't been measured, so it isn't
+claimed here. TurboQuant's KV compression is a different kind of win (bytes-per-token
+that shrinks with the codec, not a fixed offset), which is why it's the only one crossing
+multiple doubling steps.
 
 This didn't come for free — TurboQuant's default (3-bit keys, 2-bit values) trades quality
 for that ratio, and the honest version of that tradeoff is reported, not hidden:
