@@ -15,8 +15,8 @@ Metric support matrix:
   - perf.*, memory.* → HF and vLLM
 
 Usage:
-  python benchmark.py --config config/benchmark/ocr_comparison.yaml
-  python benchmark.py --config config/benchmark/ocr_comparison.yaml --dry-run
+  python benchmark.py --config config/benchmark/qwen3_1_7b.yaml
+  python benchmark.py --config config/benchmark/qwen3_1_7b.yaml --dry-run
 """
 from __future__ import annotations
 
@@ -658,7 +658,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config", "-c", required=True,
-        help="Path to a benchmark YAML config (e.g. config/benchmark/ocr_comparison.yaml)",
+        help="Path to a benchmark YAML config (e.g. config/benchmark/qwen3_1_7b.yaml)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",

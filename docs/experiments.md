@@ -14,6 +14,9 @@ numbers end to end, not just `--dry-run` validation.
 - `config/benchmark/llm_comparison.yaml` — text LLM path (PPL + MMLU-tiny + TTFT/TPOT +
   throughput + memory) smoke-tested on the HF runtime.
 - `config/benchmark/ocr_comparison.yaml` — VLM/OCR path (CER/WER/EM/BLEU) smoke-tested.
+- *(Both generic configs were later removed in the post-v1.0.0 cleanup — they pointed at
+  since-deleted TinyLlama-era checkpoint paths and were superseded by the per-model
+  configs. Recoverable from git history.)*
 - **Qwen2.5-VL-3B AWQ-W4A16 OCR sweep** (`results/qwen2.5-vl-3b-ocr-sweep/`, 5 runs,
   2026-05-29): 4 of 5 succeeded with identical CER = 0.1733 (deterministic eval, as
   expected at temperature 0 / fixed seed); the 5th run failed (mid-iteration on an
@@ -91,7 +94,7 @@ headline result, now backed by a report a stranger can read.
 ## Reproducing any of these
 
 ```bash
-python benchmark.py -c config/benchmark/qwen3_1-7b.yaml    # re-run the July 17 sweep
+python benchmark.py -c config/benchmark/qwen3_1_7b.yaml    # re-run the July 17 sweep
 python report.py --dir results/qwen3-1.7b-sweep            # regenerate the report
 ```
 

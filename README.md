@@ -138,7 +138,7 @@ What's actually implemented and measured in this repo — not a hypothetical fea
 | `llm_compressor` | ✅ | ✅ (`--quantization compressed-tensors`) | AWQ, GPTQ, PTQ, SmoothQuant |
 | `modelopt` | ✅ | ✅ (`--quantization modelopt` / `modelopt_fp4`) | AWQ, PTQ; FP8/NVFP4/MXFP4 family |
 | `torchao` | ✅ | ❌ not wired | Offline checkpoint uses `safe_serialization=False` (tensor subclasses) — no vLLM loader path built for this |
-| TurboQuant (KV cache) | ✅ (single-sequence decode) | ❌ experimental, not integrated | `src/turboquant_v1/vllm_backend.py` exists as a draft adapter but imports a module path (`turboquant.*`) that doesn't resolve in this repo — not wired into `benchmark.py` or anything runnable today |
+| TurboQuant (KV cache) | ✅ (single-sequence decode) | ❌ not integrated | A draft vLLM adapter existed but never imported cleanly; removed in cleanup (recoverable from git history) — v2 parking lot |
 
 The vLLM *serving* commands above (`vllm serve ... --quantization ...`) are vLLM's own
 documented capability for these checkpoint formats. Separately, this repo's own
@@ -290,14 +290,14 @@ inline in the script).
 ### 1. Quantize
 
 ```bash
-python quantize.py --config config/quantize/config_1b_llmcompressor.yaml
+python quantize.py --config config/quantize/qwen3_1_7b/torchao_int8wo.yaml
 ```
 
 Validates config, detects LLM vs VLM, auto-excludes vision-tower components from
 calibration, and saves to `{output_dir}/{model_name}-{backend}-{method}-{scheme}/`.
 
 <details>
-<summary>Example config (<code>config_1b_llmcompressor.yaml</code>)</summary>
+<summary>Example config (llm_compressor GPTQ-W8A8)</summary>
 
 ```yaml
 method: gptq
@@ -350,9 +350,9 @@ python tests/simple_generate.py --model <quantized> --interactive               
 ### 3. Benchmark
 
 ```bash
-python benchmark.py -c config/benchmark/llm_comparison.yaml     # PPL, MMLU-tiny, latency, throughput, memory
-python benchmark.py -c config/benchmark/ocr_comparison.yaml     # VLM OCR: CER, WER, EM, BLEU
-python benchmark.py -c config/benchmark/llm_comparison.yaml --dry-run   # validate config, no model load
+python benchmark.py -c config/benchmark/qwen3_1_7b.yaml         # PPL, MMLU-tiny, latency, throughput, memory
+python benchmark.py -c config/benchmark/qwen2_5_vl_3b.yaml      # VLM OCR: CER, WER, EM, BLEU
+python benchmark.py -c config/benchmark/qwen3_1_7b.yaml --dry-run   # validate config, no model load
 ```
 
 HF runtime computes logits-dependent quality metrics (PPL, logit-KL, token agreement) and
@@ -425,8 +425,8 @@ Each of these is deferred with a reason, not forgotten:
 * **TurboQuant Triton kernels** — fused MSE/QJL score + fused decode. Designed
   ([`notes/turboquant.md`](notes/turboquant.md) §5), not built. Current numbers all run
   on the 5-10x-slower unfused reference.
-* **TurboQuant × vLLM** — draft exists (`src/turboquant_v1/vllm_backend.py`), doesn't
-  import cleanly in this repo, not wired to anything runnable.
+* **TurboQuant × vLLM** — a draft adapter existed but never imported cleanly; removed
+  in cleanup (git history has it). Real integration is a fresh build, not a revival.
 * **Per-channel key quantization** (KIVI-style) — the real fix for TurboQuant's low-bit
   key fidelity, per [`docs/failure_cases.md`](docs/failure_cases.md#2-turboquants-default-k3v2-has-weak-next-token-agreement-at-low-bit-widths).
   A quantizer redesign, not a wiring change.
