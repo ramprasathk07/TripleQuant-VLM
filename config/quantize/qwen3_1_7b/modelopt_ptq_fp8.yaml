@@ -1,0 +1,30 @@
+# Qwen3-1.7B · ModelOpt · FP8 (FP8_DEFAULT_CFG) · nvidia-modelopt
+# Requires CUDA. FP8 compute is native on Hopper+; Ampere quantizes (simulated) + exports.
+method: ptq
+backend: modelopt
+
+model:
+  model_id: Qwen/Qwen3-1.7B
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  model_type: llm
+  modality: text
+
+scheme:
+  scheme: FP8
+  group_size: 128             # unused for per-tensor FP8 (no block_sizes)
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  num_samples: 128
+  max_seq_len: 2048
+  seed: 42
+
+output:
+  output_dir: ./outputs/qwen3-1.7b/modelopt-fp8
+  save_compressed: true
+  save_processor: true

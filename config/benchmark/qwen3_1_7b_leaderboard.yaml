@@ -1,0 +1,97 @@
+# Qwen3-1.7B leaderboard sweep — every quantization config in one table.
+# Feeds docs/qwen3_1_7b_leaderboard.md: Decode TPS / VRAM / PPL+MMLU delta vs FP16 / serving.
+# HF runtime numbers here; vLLM serving numbers come from the WSL env (scripts/wsl_vllm_bench).
+run_name: qwen3-1.7b-leaderboard
+output_root: ./results
+runtimes: ["hf"]
+
+metrics:
+  quality_llm: ["ppl", "mmlu_tiny"]
+  quality_ocr: []
+  perf:        ["ttft", "tpot", "throughput"]
+  memory:      ["disk", "vram", "load_time"]
+
+tracking:
+  enabled: ["wandb", "tensorboard"]
+  wandb_project: triplequant-bench
+
+datasets:
+  ppl_dataset: wikitext
+  ppl_subset:  wikitext-2-raw-v1
+
+latency:
+  batch_sizes:  [1]           # single-stream decode TPS is the table's column
+  output_lens:  [128]
+  num_requests: 10
+  warmup_requests: 3
+
+models:
+  - name: qwen3-1.7b-fp16-baseline
+    path: Qwen/Qwen3-1.7B
+    is_local: false
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+
+  - name: qwen3-1.7b-llmc-awq-w4a16
+    path: ./outputs/qwen3-1.7b/awq-w4a16
+    is_local: true
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    backend_hint: llm_compressor
+    vllm_quantization: compressed-tensors
+
+  - name: qwen3-1.7b-llmc-gptq-w8a8
+    path: ./outputs/qwen3-1.7b/gptq-w8a8
+    is_local: true
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    backend_hint: llm_compressor
+    vllm_quantization: compressed-tensors
+
+  - name: qwen3-1.7b-modelopt-fp8
+    path: ./outputs/qwen3-1.7b/modelopt-fp8
+    is_local: true
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    backend_hint: modelopt
+    vllm_quantization: modelopt
+
+  - name: qwen3-1.7b-torchao-int4wo
+    path: Qwen/Qwen3-1.7B
+    is_local: false
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    torchao: int4wo             # tinygemm int4 — needs sm_80+; errors gracefully if kernel missing
+
+  - name: qwen3-1.7b-awq-w4a16-turboquant
+    path: ./outputs/qwen3-1.7b/awq-w4a16
+    is_local: true
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    backend_hint: llm_compressor
+    turboquant:
+      enabled: true
+      ring_capacity: 256
+      key_bits: 3
+      value_bits: 2
+      use_qjl: false
+      use_compressed_store: true
+
+  # NVFP4: quantize/export works on Ampere (simulated), but no runtime on sm_86 —
+  # vLLM's modelopt_fp4 loader and native kernels need Blackwell. Auto-skipped here;
+  # the leaderboard table carries the row with an honest "needs Blackwell" note.
+  - name: qwen3-1.7b-modelopt-nvfp4
+    path: ./outputs/qwen3-1.7b/modelopt-nvfp4-awq
+    is_local: true
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    backend_hint: modelopt
+    vllm_quantization: modelopt_fp4
+    skip_on: ["sm_86"]
