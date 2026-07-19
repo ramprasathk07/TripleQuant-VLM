@@ -37,6 +37,10 @@ def main() -> None:
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--gpu-mem-util", type=float, default=0.85)
     p.add_argument("--output-tokens", type=int, default=256)
+    p.add_argument("--cuda-graphs", action="store_true",
+                   help="Enable CUDA graph capture / compilation (default off: engine "
+                        "init with graphs spikes host RAM, which OOMs a constrained WSL "
+                        "VM; eager slightly underreports TPS but runs everywhere)")
     args = p.parse_args()
 
     result = {
@@ -57,7 +61,7 @@ def main() -> None:
             quantization=args.quantization,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_mem_util,
-            enforce_eager=False,
+            enforce_eager=not args.cuda_graphs,
         )
         result["loaded"] = True
 
