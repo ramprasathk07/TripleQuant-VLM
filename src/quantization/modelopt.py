@@ -305,10 +305,45 @@ class ModelOptQuantizer(BaseQuantizer):
         self.model.to("cpu")
 
     def save(self, output_dir: str, weights: bool = True) -> None:
-        """Save quantized model via BaseQuantizer with descriptive subfolder naming.
+        """Export a deployable checkpoint via modelopt's HF export, not save_pretrained.
 
-        Args:
-            output_dir: Root output directory path.
-            weights: If True, save model weights; if False, skip model saving.
+        Plain ``save_pretrained`` on an mtq-quantized model stores simulated-quant
+        (bf16) weights and drops the quantizer state entirely — the result loads as
+        ordinary bf16 in transformers (bit-identical PPL to baseline) and vLLM's
+        ``--quantization modelopt`` loader refuses it ("Cannot find the config file
+        for modelopt"). ``export_hf_checkpoint`` writes the real artifact: compressed
+        weights + scale tensors + ``hf_quant_config.json`` that serving engines read.
+
+        Falls back to the base (fake-quant) save with a loud warning when export
+        doesn't support the scheme (e.g. simulated MX formats on this hardware),
+        so quantize runs still produce *something* inspectable.
         """
-        super().save(output_dir, weights=weights)
+        from pathlib import Path
+
+        model_name = self.model_id.split('/')[-1]
+        subfolder = f"{model_name}-{self.config.backend}-{self.config.method}-{self.config.scheme.scheme}"
+        final_dir = Path(output_dir) / subfolder
+
+        if weights:
+            try:
+                from modelopt.torch.export import export_hf_checkpoint
+                # Export reads quantizer state off the live module; run it on GPU
+                # (scale/amax buffers live where calibration ran).
+                if torch.cuda.is_available() and next(self.model.parameters()).device.type != "cuda":
+                    self.model.to("cuda")
+                logger.info("Exporting deployable ModelOpt checkpoint -> %s", final_dir)
+                export_hf_checkpoint(self.model, export_dir=str(final_dir))
+            except Exception:
+                logger.warning(
+                    "export_hf_checkpoint failed for scheme %s — falling back to "
+                    "fake-quant save_pretrained (NOT loadable by serving engines).",
+                    self.config.scheme.scheme, exc_info=True,
+                )
+                super().save(output_dir, weights=True)
+                return
+
+        if self.processor is not None:
+            self.processor.save_pretrained(str(final_dir))
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(str(final_dir))
+        logger.info("ModelOpt checkpoint exported -> %s", final_dir)

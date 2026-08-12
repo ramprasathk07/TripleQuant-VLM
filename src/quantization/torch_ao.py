@@ -39,11 +39,19 @@ class TorchAOQuantizer(BaseQuantizer):
             Int4WeightOnlyConfig,
             Int8DynamicActivationInt8WeightConfig,
         )
+        from torchao.quantization.quantize_.workflows.int4.int4_packing_format import (
+            Int4PackingFormat,
+        )
         gs = self.config.scheme.group_size
+        # TILE_PACKED_TO_4D: the only int4 packing format that runs on this
+        # torchao 0.17 / sm_86 stack — PLAIN/PRESHUFFLED need the uninstallable
+        # 'mslk' kernel package (see docs/qwen3_1_7b_leaderboard.md).
+        _int4 = lambda: Int4WeightOnlyConfig(
+            group_size=gs, int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D)
         builders = {
             "W8A16":      Int8WeightOnlyConfig,
-            "W4A16":      lambda: Int4WeightOnlyConfig(group_size=gs),
-            "W4A16_ASYM": lambda: Int4WeightOnlyConfig(group_size=gs),
+            "W4A16":      _int4,
+            "W4A16_ASYM": _int4,
             "W8A8":       Int8DynamicActivationInt8WeightConfig,
         }
         try:  # fp8 needs Ada/Hopper + a torchao build that ships it

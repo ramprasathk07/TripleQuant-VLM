@@ -417,10 +417,21 @@ class HFRuntime(RuntimeBase):
             quantize_, Int4WeightOnlyConfig, Int8WeightOnlyConfig,
             Int8DynamicActivationInt8WeightConfig,
         )
+        from torchao.quantization.quantize_.workflows.int4.int4_packing_format import (
+            Int4PackingFormat,
+        )
         configs = {
             "int8wo": lambda: Int8WeightOnlyConfig(),
             "int8dq": lambda: Int8DynamicActivationInt8WeightConfig(),
-            "int4wo": lambda: Int4WeightOnlyConfig(group_size=128),
+            # TILE_PACKED_TO_4D = the classic tinygemm kernel. The v2 default
+            # (PLAIN) and PRESHUFFLED both require the 'mslk' kernel package,
+            # which has no installable release; tile-packed is the only int4
+            # format that actually runs on this torchao 0.17 / sm_86 stack
+            # (verified by probing every Int4PackingFormat).
+            "int4wo": lambda: Int4WeightOnlyConfig(
+                group_size=128,
+                int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D,
+            ),
         }
         try:
             from torchao.quantization import Float8WeightOnlyConfig

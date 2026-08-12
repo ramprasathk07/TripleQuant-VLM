@@ -1,0 +1,35 @@
+# Qwen3-1.7B · AWQ · INT4 weight-only (W4A16) · llm_compressor
+method: awq
+backend: llm_compressor
+
+model:
+  model_id: Qwen/Qwen3-1.7B
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  model_type: llm
+  modality: text
+
+scheme:
+  scheme: W4A16
+  group_size: 128
+  symmetric: true
+  per_channel: false          # AWQ stays on the group strategy
+  observer: mse
+  targets: ["Linear"]
+  ignore: ["lm_head"]
+
+calibration:
+  dataset_name: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  num_samples: 512
+  max_seq_len: 1024
+  seed: 42
+
+output:
+  output_dir: ./outputs/qwen3-1.7b/awq-w4a16-c512
+  save_compressed: true
+  save_processor: true
+
+awq:
+  duo_scaling: true
