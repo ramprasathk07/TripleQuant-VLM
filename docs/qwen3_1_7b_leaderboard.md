@@ -18,11 +18,11 @@ so the CER column that a VLM version of this table would carry becomes PPL/MMLU 
 | FP16 baseline | 20.9 | 56.1 | 3.28 | — (22.45) | — (0.548) | ✅ vLLM |
 | llmcompressor AWQ-W4A16 | 4.2 | **57.9** | 1.30 | **+15.36** (37.81) | −0.032 | ✅ vLLM (`compressed-tensors`, Marlin) |
 | llmcompressor GPTQ-W8A8 | 2.8 | 49.3 | 1.95 | +0.27 (22.72) | +0.008 | ✅ vLLM (`compressed-tensors`) |
-| modelopt FP8 | **can't execute**\* | not yet verified† | 1.90 | n/a\* | n/a\* | ⚠️ export fixed, vLLM check blocked (Finding 3) |
+| modelopt FP8 | **can't execute**\* | not yet verified† | 1.95 | n/a\* | n/a\* | ⚠️ export fixed, vLLM check blocked (Finding 3) |
 | modelopt NVFP4 | n/a | n/a | n/a | n/a | n/a | ❌ needs Blackwell (sm_100+); not attempted |
 | modelopt → TRT-LLM | n/a | n/a | n/a | n/a | n/a | ❌ no supported TRT-LLM path on this Windows/WSL setup |
-| torchao int4wo | **16.7** | — | **1.44** | +14.02 (36.46) | **−0.132** | HF only (packing-format fix, Finding 5) |
-| AWQ-W4A16 + TurboQuant KV (K3V2) | 4.3 | — | 1.27 | +15.40 (37.85)‡ | −0.024‡ | HF only (TurboQuant not wired into vLLM) |
+| torchao int4wo | **16.7** | — | **1.47** | +14.02 (36.46) | **−0.132** | HF only (packing-format fix, Finding 5) |
+| AWQ-W4A16 + TurboQuant KV (K3V2) | 4.3 | — | 1.30 | +15.40 (37.85)‡ | −0.024‡ | HF only (TurboQuant not wired into vLLM) |
 
 vLLM runs (FP16/AWQ/GPTQ): 0.11.2 in WSL2 Ubuntu 24.04, eager mode (CUDA graph capture
 disabled — engine init with graphs OOMed the memory-capped VM; eager slightly
@@ -31,7 +31,7 @@ TTFT: fp16 20.8ms, W4A16 17.7ms, W8A8 35.4ms.
 
 \* **modelopt FP8 now genuinely quantizes — HF eager just can't run it.** After the
 export fix (Finding 3), the checkpoint contains real `Float8_e4m3fn` weight tensors +
-`hf_quant_config.json` (confirmed: resident VRAM dropped to 1.90 GB, ~42% below fp16).
+`hf_quant_config.json` (confirmed: resident VRAM dropped to 1.95 GB, ~41% below fp16).
 But plain `AutoModelForCausalLM.from_pretrained` + HF eager has no FP8 compute kernel, so
 every forward pass throws `RuntimeError: expected mat1 and mat2 to have the same dtype,
 but got: struct c10::BFloat16 != struct c10::Float8_e4m3fn` — PPL/MMLU/TPS are
@@ -97,7 +97,7 @@ so a reading there measures the knob, not the model).
    kernel package with no installable release. Probed every `Int4PackingFormat` on this
    GPU/stack; only `TILE_PACKED_TO_4D` (the classic tinygemm kernel) actually runs. Pinned
    it explicitly (`src/runtimes/hf/hf_runtime.py`, `src/quantization/torch_ao.py`) and
-   re-verified: real numbers now (16.7 TPS, 1.44 GB, PPL 36.46). It's also the **worst
+   re-verified: real numbers now (16.7 TPS, 1.47 GB, PPL 36.46). It's also the **worst
    quality result in the table** (MMLU −0.132, steeper than AWQ-W4A16's −0.032 at a
    similar bit-width) — torchao's `int4wo` is calibration-free round-to-nearest, with no
    activation-aware scale search like AWQ's. Cheapest int4 path here, and it shows in the
