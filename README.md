@@ -19,10 +19,12 @@ Qwen3-1.7B, RTX 3060 (12GB). Full report with methodology and every metric:
 same format with `python report.py --dir results/<run_name>`.
 
 **One model, every quantization path, HF + vLLM serving, one table:**
-[`docs/qwen3_1_7b_leaderboard.md`](docs/qwen3_1_7b_leaderboard.md) — including the rows
-that failed and why (torchao int4wo kernel gap, modelopt export gap, hardware floors).
-Headline: the same AWQ-W4A16 checkpoint runs 4.1 TPS on HF eager and 57.9 TPS under
-vLLM's Marlin kernels — faster than fp16.
+[`docs/qwen3_1_7b_leaderboard.md`](docs/qwen3_1_7b_leaderboard.md) — including two real
+bugs found and fixed along the way (a torchao int4 kernel-packing gap, a ModelOpt export
+that silently dropped quant metadata) and one still open (vLLM verification of the fixed
+FP8 export, blocked on a WSL disk repair, documented rather than hidden). Headline: the
+same AWQ-W4A16 checkpoint runs 4.2 TPS on HF eager and 57.9 TPS under vLLM's Marlin
+kernels — faster than fp16.
 
 | Model | TTFT (ms) | TPOT (ms) | VRAM (MB) | PPL | MMLU |
 |---|---|---|---|---|---|
