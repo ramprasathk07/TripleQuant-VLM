@@ -445,6 +445,12 @@ picks it up automatically.
 **v1.0 is closed.** [`docs/v1_retrospective.md`](docs/v1_retrospective.md) is the
 post-mortem: why the project started, the four findings that survive scrutiny, the four
 claims that turned out wrong and how they were caught, and what's worth doing next.
+[`docs/v2_checklist.md`](docs/v2_checklist.md) is the audited list of what's still
+missing — the serving-SLA harness (3 of 4 phases unbuilt), two stubbed metrics, and two
+model families that have never been run.
+
+**Write-ups:** [`docs/blog/`](docs/blog/) — three posts from these results, with figures
+generated from the committed JSON.
 
 ### Shipped (v1.0)
 
