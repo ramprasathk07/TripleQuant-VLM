@@ -440,8 +440,16 @@ class LatencyConfig(BaseModel):
     # = next-token agreement vs FP16 KV. Lengths must exceed tq_sweep_ring to engage the
     # compressed store.
     tq_bits_pairs:     list[list[int]] = [[2, 2], [3, 2], [4, 4], [8, 8]]
-    tq_sweep_lengths:  list[int]       = [512, 1024, 2048, 4096]
+    # Reaches 16384 because that's the context length the headline "4x context" claim
+    # rests on — ctx_sweep proves the KV cache *fits* there, and only this sweep can say
+    # whether output is still usable there. Stopping at 4096 (the old default) left the
+    # top of that claim quality-unverified.
+    tq_sweep_lengths:  list[int]       = [512, 1024, 2048, 4096, 8192, 16384]
     tq_sweep_ring:     int             = 256
+    # Positions compared per (bit-width, context) point = the sample size behind every
+    # agreement number. Was hardcoded at 64, giving a ~5pp binomial SE that made the
+    # context-length axis unreadable (trends smaller than their error bars).
+    tq_compare_positions: int          = 512
 
 class TurboQuantRuntimeConfig(BaseModel):
     """Per-model TurboQuant KV-cache settings for benchmarking.

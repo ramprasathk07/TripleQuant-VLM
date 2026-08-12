@@ -241,3 +241,56 @@ repo or elsewhere. Report `correct/total` and a CI, not a lone ratio; use a pair
 when the same items are scored by both systems. The same "metric can't see what you
 think it sees" failure mode also produced case #4 above (teacher-forced PPL cannot
 observe KV-cache quantization) — worth reading the two together.
+
+---
+
+## 10. The headline "4x context" claim had no quality measurement behind it (fixed 2026-08-12)
+
+**Symptom:** the README led with "TurboQuant K3V2 reaches 16,384 tokens — 4x fp16." True
+as stated, and materially misleading: it was a pure *memory-capacity* claim presented
+where a reader would assume usability.
+
+**Root cause — two separate blind spots:**
+1. `measure_ctx_sweep`, which produces the 4x number, records
+   `kv_cache_mb / peak_vram_mb / fits`. **There is no accuracy field in it at all.** It
+   answers "does the cache fit", never "is the output any good".
+2. `measure_bits_accuracy`, the one metric that *does* pair quality with context length,
+   stopped at 4,096 — below the 16,384 the claim rested on — and compared only
+   `min(64, ...)` positions per point, a ~5pp binomial SE. The apparent context trends
+   were smaller than their own error bars: K2V2 *rose* mid-sweep, K4V4 dipped at 2048 and
+   recovered. Unreadable.
+
+So the claim's context range and its quality range never overlapped.
+
+**Fix:** `compare_positions` is now configurable (`latency.tq_compare_positions`, default
+512 → SE ~1-3pp), `tq_sweep_lengths` extends to 16,384 to cover the claim, and each grid
+point carries `top1_stderr`. Then re-run, plus a context sweep at K8V8 to find the
+capacity of a *quality-preserving* setting.
+
+**What the measurement actually showed — the claim survived, but pointed at the wrong
+configuration:**
+
+| Setting | Max context | Top-1 agreement @16K | KV compression @16K |
+|---|---|---|---|
+| fp16 | 4,096 | — | 1.0x |
+| TurboQuant K3V2 (was showcased) | 16,384 | **0.193** | 4.81x |
+| TurboQuant K8V8 | 16,384 | **0.918** | 1.73x |
+
+K8V8 delivers the same 4x capacity *with* quality intact. K3V2's extra compression buys
+no additional context here and costs almost all output fidelity. **We had been
+showcasing the strictly worse of the two.** Also settled: agreement does not decay with
+context at any bit-width (K3V2 is as poor at 512 as at 16K), so the low-bit problem is
+the bit budget, not long context.
+
+**Two caveats kept in the docs rather than smoothed over:**
+- The sweep varies context length *and* the compared text together (each length compares
+  the last N positions of a different-length slice), so per-length wobble is confounded
+  and shouldn't be read as a context effect.
+- "Max context" is what a single full-prefill forward pass fits in 12 GB, and that peak
+  is dominated by the all-position logits tensor rather than the KV cache. Valid as a
+  *relative* comparison under an identical probe; not a serving capacity number.
+
+**Lesson:** when a headline pairs two axes ("this much context"), check that the
+supporting measurement actually spans both. Here the capacity probe and the quality probe
+covered disjoint ranges, and nothing in the pipeline flagged it — the same structural
+blind spot as #4 and #9, in a third place.

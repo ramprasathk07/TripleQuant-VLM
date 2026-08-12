@@ -1,0 +1,40 @@
+# TurboQuant quality-vs-context sweep.
+#
+# Answers the question ctx_sweep cannot: ctx_sweep shows the compressed KV cache *fits*
+# at 16K tokens (the "4x context" headline), but it measures memory only — no accuracy
+# field exists in it. This config runs tq_bits_sweep alone, out to the same 16384, with
+# a large enough comparison window to make the context axis readable.
+run_name: qwen3-1.7b-tq-quality
+output_root: ./results
+runtimes: ["hf"]
+
+metrics:
+  quality_llm: []          # PPL/MMLU don't vary with context here; skip for speed
+  quality_ocr: []
+  perf:        ["tq_bits_sweep"]
+  memory:      ["vram"]
+
+tracking:
+  enabled: ["wandb", "tensorboard"]
+  wandb_project: triplequant-bench
+
+latency:
+  tq_bits_pairs:        [[2, 2], [3, 2], [4, 4], [8, 8]]
+  tq_sweep_lengths:     [512, 1024, 2048, 4096, 8192, 16384]
+  tq_sweep_ring:        256
+  tq_compare_positions: 512      # was 64 -> SE ~5pp; 512 gives ~2pp
+
+models:
+  - name: qwen3-1.7b-turboquant-k3v2
+    path: Qwen/Qwen3-1.7B
+    is_local: false
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    turboquant:
+      enabled: true
+      ring_capacity: 256
+      key_bits: 3
+      value_bits: 2
+      use_qjl: false
+      use_compressed_store: true

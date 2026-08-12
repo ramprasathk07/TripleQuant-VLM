@@ -37,15 +37,33 @@ KV-cache technique. \* MMLU delta is noise (small sample), not a real quality di
 [explained in the report](docs/benchmark_report.md).*
 
 **The number that matters for a KV-cache codec isn't short-context VRAM — it's how far
-context can grow before the cache exhausts the GPU:**
+context can grow before the cache exhausts the GPU, at a bit-width whose output you'd
+actually ship:**
 
-| Model | Max usable context, this GPU |
-|---|---|
-| fp16 baseline | 4,096 tokens |
-| torchao int8wo | 4,096 tokens (same bucket as fp16 — see note) |
-| **TurboQuant K3V2** | **16,384 tokens (4x fp16/torchao)** |
+| Model | Max context, this GPU | Top-1 agreement vs FP16 @16K |
+|---|---|---|
+| fp16 baseline | 4,096 tokens | — (reference) |
+| torchao int8wo | 4,096 tokens (same bucket as fp16 — see note) | n/a (weight-only) |
+| **TurboQuant K8V8** | **16,384 tokens (4x)** | **0.918 — quality preserved** |
+| TurboQuant K3V2 | 16,384 tokens | 0.193 — fits, but output diverges badly |
 
 ![Peak VRAM vs context length](docs/plots/ctx_sweep.png)
+
+**Read the two TurboQuant rows together — that contrast is the actual finding.** Both
+bit-widths reach 4x fp16's context, so capacity alone doesn't distinguish them; the
+agreement column does. K8V8 keeps 92% next-token agreement with FP16 at 16K while
+compressing the KV cache 1.73x — that's the setting worth shipping. K3V2 compresses 4.81x
+but agrees only ~19% of the time *at every context length* (not a long-context problem —
+it's equally poor at 512), which makes its extra compression worthless. Earlier versions
+of this table led with K3V2 and reported the 4x capacity without any quality measurement
+behind it; that was the wrong default to showcase, and it took an explicit
+accuracy-vs-context sweep to catch (`docs/failure_cases.md` #10).
+
+*Measurement note:* "max context" here is the longest sequence a single full-prefill
+forward pass fits in 12 GB. That probe's peak is dominated by the all-position logits
+tensor, not the KV cache, so these are **relative** numbers under an identical probe (only
+the KV codec differs), not a serving capacity figure — real serving chunks prefill and
+keeps only the last position's logits.
 
 Note: torchao's smaller resident-weight footprint does buy real headroom at every
 matched context length (e.g. 5,324 MB vs fp16's 6,364 MB at 4,096 tokens) — it just isn't
@@ -57,15 +75,24 @@ claimed here. TurboQuant's KV compression is a different kind of win (bytes-per-
 that shrinks with the codec, not a fixed offset), which is why it's the only one crossing
 multiple doubling steps.
 
-This didn't come for free — TurboQuant's default (3-bit keys, 2-bit values) trades quality
-for that ratio, and the honest version of that tradeoff is reported, not hidden:
+The full bit-width tradeoff, measured at 512 comparison positions per point across
+context 512→16,384 (SE ~1-3pp):
 
 ![TurboQuant bits tradeoff](docs/plots/tq_bits_tradeoff.png)
 
-At K3V2, next-token agreement with FP16 is 9-19% (value-bit precision is the bottleneck,
-not key-bit — K2V2 and K3V2 score within noise of each other). K8V8 is near-lossless
-(~97-98%) at a more modest 1.3-1.7x compression. Full tradeoff table, root cause, and the
-real fix (per-channel key quantization) in
+| Bits | Top-1 agreement (512 → 16K) | KV compression @16K |
+|---|---|---|
+| K2V2 | 0.105 → 0.082 | 5.65x |
+| K3V2 | 0.266 → 0.193 | 4.81x |
+| K4V4 | 0.402 → 0.307 | 3.02x |
+| **K8V8** | **0.981 → 0.918** | 1.73x |
+
+Two things this says. First, **the cliff is between K4V4 and K8V8**, not gradual —
+everything below 8 bits lands under 40% agreement, so the "aggressive compression" band
+is mostly unusable on this model. Second, **agreement doesn't systematically decay with
+context** at any bit-width: K3V2 is as poor at 512 as at 16K. Long context isn't what
+breaks it; the bit budget is. Root cause (per-vector key quantization vs. outlier
+channels) and the real fix (per-channel keys, KIVI-style) in
 [`docs/failure_cases.md`](docs/failure_cases.md#2-turboquants-default-k3v2-has-weak-next-token-agreement-at-low-bit-widths).
 
 ---
@@ -414,6 +441,10 @@ picks it up automatically.
 ---
 
 ## Roadmap
+
+**v1.0 is closed.** [`docs/v1_retrospective.md`](docs/v1_retrospective.md) is the
+post-mortem: why the project started, the four findings that survive scrutiny, the four
+claims that turned out wrong and how they were caught, and what's worth doing next.
 
 ### Shipped (v1.0)
 

@@ -1,0 +1,37 @@
+# Context capacity at a QUALITY-PRESERVING TurboQuant setting (K8V8).
+#
+# The headline "4x context" number was measured at K3V2, whose top-1 agreement with FP16
+# is ~0.19-0.27 at every context length (see results/qwen3-1.7b-tq-quality). K8V8 holds
+# 0.918 agreement at 16K but compresses far less. This sweep answers the question that
+# actually matters for a deployable setting: how much context fits when quality is kept?
+run_name: qwen3-1.7b-tq-ctx-k8v8
+output_root: ./results
+runtimes: ["hf"]
+
+metrics:
+  quality_llm: []
+  quality_ocr: []
+  perf:        ["ctx_sweep"]
+  memory:      ["vram"]
+
+tracking:
+  enabled: ["wandb", "tensorboard"]
+  wandb_project: triplequant-bench
+
+latency:
+  ctx_sweep: [512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+models:
+  - name: qwen3-1.7b-turboquant-k8v8
+    path: Qwen/Qwen3-1.7B
+    is_local: false
+    model_type: llm
+    model_class: causal_lm
+    dtype: bfloat16
+    turboquant:
+      enabled: true
+      ring_capacity: 256
+      key_bits: 8
+      value_bits: 8
+      use_qjl: false
+      use_compressed_store: true

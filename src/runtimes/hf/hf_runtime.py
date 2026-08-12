@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import math
 import statistics
 import time
 from typing import Optional, Tuple
@@ -1306,6 +1307,7 @@ class HFRuntime(RuntimeBase):
         bit_pairs: list[list[int]],
         lengths:   list[int],
         ring_capacity: int = 256,
+        compare_positions: int = 512,
     ) -> dict:
         """Next-token agreement vs FP16 KV, swept over bit budgets x context length.
 
@@ -1344,7 +1346,12 @@ class HFRuntime(RuntimeBase):
             # only the far history compressed — that's the regime that matters. Comparing
             # all [ring:] positions is unrealistically harsh because mid-sequence tokens'
             # recent context lands in the compressed store, not the ring.
-            compare = min(64, L - ring_capacity)
+            #
+            # The window size is the sample size of every agreement figure below. At the
+            # old hardcoded 64 the binomial SE was ~5pp, which made the whole
+            # accuracy-vs-context-length axis unreadable: apparent trends across L were
+            # smaller than their own error bars (see docs/failure_cases.md #10).
+            compare = min(compare_positions, L - ring_capacity)
             try:
                 with torch.no_grad():
                     base_logits = self.model(input_ids=ids, use_cache=False).logits[0]  # (L, V)
@@ -1388,6 +1395,11 @@ class HFRuntime(RuntimeBase):
                         "kv_cache_mb": round(kv_mb, 3),
                         "compression_ratio": round(fp16_kv_mb / kv_mb, 2) if kv_mb else None,
                         "n_positions": int(base_arg.numel()),
+                        # Binomial SE of top1_agreement. Carried alongside so a reader
+                        # can see whether a difference across bit-widths or context
+                        # lengths is larger than its own error bar.
+                        "top1_stderr": round(
+                            math.sqrt(max(agree * (1 - agree), 0.0) / max(int(base_arg.numel()), 1)), 5),
                     })
                     del cache, tq_logits
                     torch.cuda.empty_cache()

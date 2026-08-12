@@ -54,17 +54,25 @@ it, so no `e2fsck` was needed after all.)
 
 ## Results — the two things that matter
 
-**1. TurboQuant's actual value prop (RTX 3060, 12GB):**
+**1. TurboQuant's actual value prop (RTX 3060, 12GB) — CORRECTED 2026-08-12 evening:**
 
-| Model | Max usable context |
-|---|---|
-| fp16 baseline | 4,096 tokens |
-| torchao int8wo | 4,096 tokens |
-| **TurboQuant K3V2** | **16,384 tokens — 4x** |
+| Model | Max context | Top-1 agreement @16K |
+|---|---|---|
+| fp16 baseline | 4,096 | — |
+| torchao int8wo | 4,096 | n/a (weight-only) |
+| **TurboQuant K8V8** | **16,384 — 4x** | **0.918 (quality preserved)** |
+| TurboQuant K3V2 | 16,384 | 0.193 (fits, output diverges) |
 
-Cost: K3V2's next-token agreement vs fp16 is weak (9-19%) — value-bit precision is the
-bottleneck, not key-bit. K8V8 is near-lossless (~97%) at only 1.3-1.7x compression.
-Full chart + tradeoff table: `docs/benchmark_report.md`.
+**Ship K8V8, not K3V2.** Both reach 4x context; only K8V8 keeps quality. K3V2 was the
+showcased default and is strictly worse — same capacity, ~1/5 the agreement. Its 4.81x
+KV compression (vs K8V8's 1.73x) buys no additional context on this card.
+
+Also settled: agreement does **not** decay with context — K3V2 is as poor at 512 as at
+16K, so the bit budget is the constraint, not long context. Quality cliff sits between
+K4V4 (0.307) and K8V8 (0.918). Caveat: "max context" = longest single full-prefill
+forward pass that fits 12GB; that peak is dominated by the all-position logits tensor,
+not the KV cache — valid as a relative comparison, not a serving number.
+Full tradeoff: `docs/benchmark_report.md`, `docs/failure_cases.md` #10.
 
 **2. Qwen3-1.7B full quantization leaderboard** (`docs/qwen3_1_7b_leaderboard.md`):
 

@@ -68,10 +68,15 @@ fresh venv sidestepped it entirely.)
 
 ‡ Teacher-forced PPL can't see KV-cache quantization (the cache is never read back during
 scoring — `docs/failure_cases.md` #4), so the TQ row's PPL ≈ its base checkpoint's. TQ's
-real quality cost is next-token agreement (`docs/benchmark_report.md`), and its real win
-is context capacity: 4x fp16 on this card. The row is here to show the two quantizers
-*compose* — weight quant (AWQ) and KV quant (TurboQuant) stack without interference:
-same VRAM, same TPS, same PPL as plain AWQ within noise.
+real quality cost is next-token agreement, and its real win is context capacity — **but
+only at a bit-width that preserves quality.** Measured across context 512→16,384 at 512
+comparison positions per point: K8V8 reaches 16,384 tokens (4x fp16's 4,096) at 0.918
+agreement, while the K3V2 shown in this row reaches the same capacity at 0.193. K3V2's
+larger compression ratio buys no extra context here and costs nearly all fidelity — see
+`docs/failure_cases.md` #10. This row is retained because it shows the two quantizers
+*compose*: weight quant (AWQ) and KV quant (TurboQuant) stack without interference —
+same VRAM, same TPS, same PPL as plain AWQ within noise. For a deployable TQ config,
+use K8V8.
 
 HF decode TPS = single-stream batch-1, greedy, 128 forced tokens, HF `generate` eager.
 vLLM decode TPS = same shape via `scripts/vllm_bench.py` (temperature 0, 256 forced

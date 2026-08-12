@@ -133,7 +133,8 @@ def run_perf_metrics(runtime, config, perf_prompt: str = _DEFAULT_PERF_PROMPT,
             out["tq_bits_sweep"] = oom_safe(
                 "tq_bits_sweep",
                 lambda: runtime.measure_bits_accuracy(
-                    lat.tq_bits_pairs, lat.tq_sweep_lengths, lat.tq_sweep_ring),
+                    lat.tq_bits_pairs, lat.tq_sweep_lengths, lat.tq_sweep_ring,
+                    compare_positions=lat.tq_compare_positions),
             )
         else:
             out["tq_bits_sweep"] = {"skipped": "runtime has no measure_bits_accuracy()"}
