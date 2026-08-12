@@ -135,6 +135,21 @@ footprint, not throughput.
 **Status:** documented hardware floor, not a bug. See the README's Hardware Compatibility
 Floors table. Confirmed correct but slow in practice on this project's dev hardware.
 
+**Update (2026-08-12) — vLLM refuses FP8 outright on Ampere, it doesn't even emulate.**
+Serving the ModelOpt FP8 checkpoint through vLLM 0.11.2 fails at config validation:
+
+```
+The quantization method modelopt is not supported for the current GPU.
+Minimum capability: 89. Current capability: 86.
+```
+
+So there are two distinct behaviours worth keeping straight: the *HF/torch* path will
+happily run FP8 numerics in emulation (slow, works), while *vLLM* gates on compute
+capability and declines to load at all. "FP8 is emulated on Ampere" is true of the
+framework, not of every runtime. Useful corollary: this error is also how we verified the
+ModelOpt export fix (case #3 in `docs/qwen3_1_7b_leaderboard.md`) — reaching a *hardware*
+rejection means the checkpoint's metadata parsed correctly, which it previously did not.
+
 ---
 
 ## 6. NVIDIA ModelOpt's CUDA extension won't JIT on Windows (no MSVC `cl.exe`)

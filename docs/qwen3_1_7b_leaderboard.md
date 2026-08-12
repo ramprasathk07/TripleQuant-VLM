@@ -18,7 +18,7 @@ so the CER column that a VLM version of this table would carry becomes PPL/MMLU 
 | FP16 baseline | 21.5 | 56.1 | 3.28 | — (22.45) | — (0.5337, 427/800) | ✅ vLLM |
 | llmcompressor AWQ-W4A16 | 4.3 | **57.9** | 1.30 | **+15.36** (37.81) | −1.1pp (p=0.53, ns) | ✅ vLLM (`compressed-tensors`, Marlin) |
 | llmcompressor GPTQ-W8A8 | 2.6 | 49.3 | 1.95 | +0.27 (22.72) | +0.9pp (p=0.19, ns) | ✅ vLLM (`compressed-tensors`) |
-| modelopt FP8 | **can't execute**\* | not yet verified† | 1.95 | n/a\* | n/a\* | ⚠️ export fixed, vLLM check blocked (Finding 3) |
+| modelopt FP8 | **can't execute**\* | **can't execute**† | 1.95 | n/a\* | n/a\* | ❌ needs Ada+ (sm_89); export verified correct |
 | modelopt NVFP4 | n/a | n/a | n/a | n/a | n/a | ❌ needs Blackwell (sm_100+); not attempted |
 | modelopt → TRT-LLM | n/a | n/a | n/a | n/a | n/a | ❌ no supported TRT-LLM path on this Windows/WSL setup |
 | torchao int4wo | **17.3** | — | **1.47** | +14.02 (36.46) | **−9.9pp (p<0.0001)** | HF only (packing-format fix, Finding 5) |
@@ -47,15 +47,24 @@ structurally unmeasurable on this runtime, not degraded. That's expected: FP8 ex
 lives in serving engines (vLLM, TensorRT-LLM), not vanilla HF eager. The VRAM number is
 real and reported; the compute numbers require the vLLM row.
 
-† **vLLM verification of the FP8 export is blocked, not skipped — the WSL2 disk backing
-`vllm-env` has real ext4 corruption** (`dmesg`: "Detected aborted journal", filesystem
-remounted read-only), discovered mid-bench. Root cause: unclear, likely an improper
-shutdown during this or an earlier session's interim TensorRT-LLM work in the same WSL
-distro. Fix is `e2fsck -f` (or a clean venv rebuild) — deliberately **not** run
-unattended, since a filesystem repair on a disk holding other in-progress work
-(TRT-LLM experiments — see `~/.wslconfig` history) is a call for whoever owns that work,
-not something to do silently. FP16/AWQ/GPTQ vLLM numbers above predate the corruption and
-are unaffected (confirmed the underlying checkpoints are unchanged since that measurement).
+† **The FP8 export fix is verified — by the error message changing.** vLLM was re-run
+against the fixed checkpoint in a clean `vllm-env2` (vLLM 0.11.2, WSL2). Before the fix
+it failed with `Cannot find the config file for modelopt` — a *repo* bug, the export was
+missing its quant metadata entirely. After the fix it fails with:
+
+```
+The quantization method modelopt is not supported for the current GPU.
+Minimum capability: 89. Current capability: 86.
+```
+
+vLLM now parses the checkpoint, reads its `hf_quant_config.json`, and gets all the way to
+the hardware-capability gate before stopping. That is the export working correctly: FP8
+serving needs compute capability **sm_89 (Ada Lovelace)** and this RTX 3060 is **sm_86
+(Ampere)**. The row is unservable *here* for the same reason as NVFP4 — a hardware floor,
+not a defect. On an Ada/Hopper card this checkpoint should serve as-is; that's untested by
+us and stated as an expectation, not a result. (An earlier attempt hit ext4 journal
+corruption on the original `vllm-env` disk; it cleared on remount, and the rebuild in a
+fresh venv sidestepped it entirely.)
 
 ‡ Teacher-forced PPL can't see KV-cache quantization (the cache is never read back during
 scoring — `docs/failure_cases.md` #4), so the TQ row's PPL ≈ its base checkpoint's. TQ's
@@ -97,8 +106,11 @@ so a reading there measures the knob, not the model).
    `modelopt.torch.export.export_hf_checkpoint`. Re-quantized and confirmed: the
    checkpoint now ships `hf_quant_config.json` + real `Float8_e4m3fn` tensors, and HF
    correctly identifies it can't execute FP8 (see \* above) rather than silently lying
-   about it. vLLM-side confirmation (the actual point of the fix) is blocked by the WSL
-   corruption in finding †, above.
+   about it. **vLLM-side confirmation now done too, and the error message is the
+   receipt**: the loader went from "can't find the config" (repo's fault) to "needs
+   sm_89, you have sm_86" (hardware floor) — see † above. The fix is verified end to end;
+   the row stays unservable on this GPU for a reason that has nothing to do with the
+   repo.
 4. **The same checkpoint is 13x slower than fp16 in HF eager and *faster* than fp16 in
    vLLM.** AWQ-W4A16: 4.3 TPS on HF eager (per-op dequant, no fused kernels) vs 57.9 TPS
    under vLLM's Marlin kernels — edging out even fp16's 56.1. Never benchmark a
@@ -157,9 +169,12 @@ full environment provenance).
 
 ## Open items
 
-- **modelopt FP8 vLLM verification** — blocked on WSL disk repair (`e2fsck -f` on the
-  Ubuntu-24.04 distro, or a clean `vllm-env` rebuild in a fresh distro). Once resolved:
-  `python scripts/vllm_bench.py --model outputs/qwen3-1.7b/modelopt-fp8/Qwen3-1.7B-modelopt-ptq-FP8 --quantization modelopt`.
+- ~~modelopt FP8 vLLM verification~~ — **done.** Export confirmed correct; the row is
+  blocked by a hardware floor (sm_89 required, sm_86 available), not by the repo. Would
+  need an Ada/Hopper/Blackwell GPU to produce a real serving number.
 - **AWQ-W4A16 at 512-sample calibration** — does more calibration data close the +15.4
   PPL gap? Genuinely unknown; the attempt that would answer this was killed for cost, not
   because it failed.
+- **Kernel work** — the 13x HF-eager-vs-vLLM gap on the *same* AWQ checkpoint is the
+  clearest optimization target this table exposes. Ordered ramp:
+  [`docs/kernel_learning_path.md`](kernel_learning_path.md).

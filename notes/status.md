@@ -30,13 +30,18 @@ modules removed (`src/data/`, `src/integrations/`, broken `vllm_backend.py` draf
 - torchao int4wo failed to load — default int4 kernel needs an uninstallable `mslk`
   package. Fixed by pinning `Int4PackingFormat.TILE_PACKED_TO_4D` explicitly.
 
+**FP8 export fix — verified end to end (2026-08-12 evening).** Rebuilt a clean
+`~/vllm-env2` (vLLM 0.11.2) and re-ran. The proof is that the *error changed*:
+- before: `Cannot find the config file for modelopt` ← repo bug, metadata missing
+- after: `modelopt is not supported for the current GPU. Minimum capability: 89.
+  Current capability: 86.` ← hardware floor
+
+vLLM now parses the checkpoint fully and stops at the capability gate. FP8 serving needs
+sm_89 (Ada); the 3060 is sm_86. Unservable here for the same reason as NVFP4 — not a
+defect. (The old `vllm-env` ext4 corruption cleared on remount; the fresh venv sidestepped
+it, so no `e2fsck` was needed after all.)
+
 **Known bugs, still open:**
-- **vLLM verification of the FP8 export fix is blocked** — the WSL2 disk backing
-  `/home/ramk/vllm-env` has real ext4 corruption (`dmesg`: aborted journal, filesystem
-  remounted read-only). Needs `e2fsck -f` or a fresh venv in a clean distro. **Not done
-  unattended** because that WSL distro also holds other in-progress TensorRT-LLM
-  experimentation (from 2026-08-01, not done via Claude Code, no git trace of it) —
-  repair could affect that work, so it's your call when to do it.
 - AWQ-W4A16 at 512-sample calibration (does more calibration data close the +15.4 PPL
   gap at 128 samples?) — attempted, killed after ~2h when per-layer smoothing time
   scaled ~50x with 4x the samples. Genuinely unanswered.
@@ -68,11 +73,12 @@ Full chart + tradeoff table: `docs/benchmark_report.md`.
 | FP16 **(baseline)** | 21.5 | 56.1 | 3.28 | 22.45 | 0.5337 (427/800) |
 | AWQ-W4A16 | 4.3 | **57.9** | 1.30 | 37.81 (**+15.4**) | 0.5225 (−1.1pp, ns) |
 | GPTQ-W8A8 | 2.6 | 49.3 | 1.95 | 22.72 (+0.27) | 0.5425 (+0.9pp, ns) |
-| modelopt FP8 | can't execute* | blocked (WSL) | 1.95 | n/a | n/a |
+| modelopt FP8 | can't execute* | needs sm_89** | 1.95 | n/a | n/a |
 | torchao int4wo | 17.3 | — | 1.47 | 36.46 (+14.0) | 0.4350 (**−9.9pp, real**) |
 | AWQ + TurboQuant KV | 4.3 | — | 1.30 | 37.85 (+15.4) | 0.5325 (−0.1pp, ns) |
 
 \* HF eager has no FP8 compute kernel — expected, not a bug.
+\*\* vLLM refuses FP8 on sm_86 (needs Ada sm_89+). Export itself verified correct.
 **FP16 metrics are not missing** — it's the baseline, so its *delta* is zero by
 definition. Absolute values shown above (PPL 22.45, MMLU 0.5337). "ns" = not
 statistically significant.
@@ -136,11 +142,11 @@ W&B project: `wandb.ai/New_103/triplequant-bench`. GitHub: `ramprasathk07/Triple
    `notes/kernel_scope.md` (priorities, Triton vs TileLang). Suggested first move: the
    standalone int4 dequant benchmark (Level 2) — reproduces the 13x gap with your own
    code, cheapest path from reading about memory-bound kernels to measuring one.
-2. FP8 vLLM verification — fresh `~/vllm-env2` was being built when this note was
-   written; old `~/vllm-env` had ext4 journal corruption (cleared on remount, but not
-   trusted). Command in the block above.
-3. Open question: does 512-sample AWQ calibration recover any of the +15.4 PPL? The run
+2. Open question: does 512-sample AWQ calibration recover any of the +15.4 PPL? The run
    that would answer it was killed at ~2h (per-layer smoothing scales ~50x with 4x
    samples). Would need a wider timeout or a smaller model.
+3. FP8/NVFP4 serving numbers need an Ada+ GPU (sm_89 / sm_100). Nothing more to do on
+   this box — checkpoints are correct, hardware is the limit. Working vLLM env is
+   `~/vllm-env2` (WSL2, vLLM 0.11.2).
 4. Everything else is genuinely done — v1.0.0 tagged, docs evidence-first and verified,
    no known open correctness bugs in the shipped code path.
