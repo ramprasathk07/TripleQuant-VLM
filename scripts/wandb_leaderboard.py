@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -67,6 +68,14 @@ def main() -> None:
     serving = _load_serving(results_dir)
 
     import wandb
+
+    # The .env scaffold ships WANDB_ENTITY as an unfilled placeholder; wandb.init()
+    # reads it straight from the environment regardless of what's passed here, and
+    # errors with "entity ... not found during upsertBucket" if left in place. Same
+    # guard as src/tracking/wandb_connector.py.
+    entity = os.environ.get("WANDB_ENTITY")
+    if entity and ("your_" in entity or "username_or_team" in entity or not entity.strip()):
+        os.environ.pop("WANDB_ENTITY", None)
 
     run = wandb.init(
         project=args.project,
