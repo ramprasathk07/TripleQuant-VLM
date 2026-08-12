@@ -115,7 +115,9 @@ accumulate in SRAM without ever writing a dequantized vector back to memory. **N
 built** — every number above runs on the unfused PyTorch reference path (5-10x slower
 than a fused kernel would be). Kernel design (Triton, math + pseudocode for all four
 candidate kernels) is scoped in [`notes/turboquant.md`](notes/turboquant.md) §5 and
-[`notes/kernel_scope.md`](notes/kernel_scope.md).
+[`notes/kernel_scope.md`](notes/kernel_scope.md); an ordered, easiest-first ramp through
+that material is in
+[`docs/kernel_learning_path.md`](docs/kernel_learning_path.md).
 
 Design docs: [`notes/turboquant.md`](notes/turboquant.md) (algorithm),
 [`notes/turboquant_hf_cache_guide.md`](notes/turboquant_hf_cache_guide.md) (HF

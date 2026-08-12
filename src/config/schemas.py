@@ -360,6 +360,7 @@ class EvalDatasetConfig(BaseModel):
     Attributes:
         ppl_dataset, ppl_subset: Perplexity evaluation dataset.
         mmlu_subjects: MMLU subjects to evaluate (subset of cais/mmlu).
+        mmlu_num_q_per_subject: Questions sampled per subject; total n = subjects * this.
         gsm8k_dataset, gsm8k_num_samples, gsm8k_max_new_tokens: Grade-school math config.
         aime_dataset, aime_split, aime_num_samples, aime_max_new_tokens: Competition math config.
         ceval_dataset, ceval_subjects, ceval_num_q_per_subject: Chinese MMLU config.
@@ -376,6 +377,11 @@ class EvalDatasetConfig(BaseModel):
     # ── MMLU (valid cais/mmlu subject configs only) ──
     mmlu_subjects: list[str] = ["high_school_mathematics", "high_school_computer_science",
                                 "philosophy", "high_school_world_history", "global_facts"]
+    # Questions per subject. Total n = len(mmlu_subjects) * this. Drives the noise
+    # floor: n=250 gives a binomial SE of ~3.1pp (95% CI ~+/-6pp), so sub-2pp
+    # accuracy gaps between two models are indistinguishable from sampling noise.
+    # Raise it (and/or add subjects) when a comparison needs to resolve small deltas.
+    mmlu_num_q_per_subject: int = 50
 
     # ── GSM8K (grade-school math, generative) ──
     gsm8k_dataset: str = "openai/gsm8k"

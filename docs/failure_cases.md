@@ -180,4 +180,49 @@ score, fused decode) are scoped and designed (math + pseudocode in `notes/turboq
 §5) but not implemented. This means every TPOT/TPS number in `docs/benchmark_report.md`
 for the TurboQuant entries reflects the *unfused* reference implementation — the memory
 story (context-length capacity) is real and already measured; the latency story has more
-headroom than what's shown once/if the kernels land.
+headroom than what's shown once/if the kernels land. Ordered learning path for building
+them: [`docs/kernel_learning_path.md`](kernel_learning_path.md).
+
+---
+
+## 9. Reporting an accuracy metric without its sample size (fixed 2026-08-12)
+
+**Symptom:** the leaderboard showed several quantized models *beating* the FP16 baseline
+on MMLU (+0.8pp, +1.6pp), and one finding was written up asserting AWQ-W4A16 cost −3.2pp
+MMLU. Both directions were wrong.
+
+**Root cause:** `eval_mmlu_tiny` returned a bare `correct / total` float. With the
+denominator discarded, nothing downstream — not the results JSON, not the comparison
+table, not the docs — could tell that n was only 250 (5 subjects × 50, a hardcoded
+constant). At n=250 the binomial standard error is ±3.1pp and the 95% CI is ±6.2pp, so:
+
+| Reported delta | What it actually was |
+|---|---|
+| +0.8pp "improvement" | 2 questions out of 250 |
+| +1.6pp "improvement" | 3 questions |
+| −3.2pp "regression" (written up as a finding) | 8 questions, ~1 SE |
+
+A quantized model cannot gain capability its base model lacked — an apparent improvement
+is the null hypothesis announcing itself. That should have been the tell.
+
+**Fix, three parts:**
+1. `eval_mmlu_tiny` now returns `{acc, correct, total, stderr, per_subject,
+   per_question}`. A metric that carries its own sample size can't hide this.
+2. The question count moved from a hardcoded `_MMLU_Q_PER_SUBJECT = 50` in `benchmark.py`
+   to `datasets.mmlu_num_q_per_subject` in the config, and was raised to 200 (n≈800).
+3. `scripts/mmlu_significance.py` runs the **paired McNemar exact test** — the correct
+   tool, since every model answers identical questions, making the discordant pairs far
+   more informative than two independent accuracy figures.
+
+**Result after re-running at n=800:** every MMLU delta except torchao int4wo's (−9.9pp,
+p<0.0001) is not significant. AWQ-W4A16 came in at −1.1pp, p=0.53 — the finding it had
+generated was retracted. The discordant counts turned out to be the more interesting
+signal anyway: AWQ changes 163 of 800 answers but symmetrically (86 broken / 77 fixed),
+while int4wo changes 265 asymmetrically (172 / 93). Same headline "4-bit weights", very
+different mechanisms.
+
+**Generalizes to:** any accuracy-style eval (MMLU, GSM8K, HumanEval, C-Eval) in this
+repo or elsewhere. Report `correct/total` and a CI, not a lone ratio; use a paired test
+when the same items are scored by both systems. The same "metric can't see what you
+think it sees" failure mode also produced case #4 above (teacher-forced PPL cannot
+observe KV-cache quantization) — worth reading the two together.

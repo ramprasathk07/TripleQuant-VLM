@@ -62,9 +62,20 @@ this measurement's resolution can't quantify it precisely."
   metric being measured before the KV cache has grown enough to matter. See the context
   chart above for TurboQuant's actual memory story.
 - **turboquant-k3v2 MMLU** (0.564) edging out fp16 (0.548) is noise, not a real quality
-  improvement — MMLU-tiny's sample size is small enough that a ~1.6pp gap isn't
-  meaningful, and there's no mechanism by which lossy KV compression should *improve*
-  accuracy. Don't cite this as a finding.
+  improvement — and this has since been quantified rather than asserted. This sweep used
+  n=250 questions, where the binomial SE is ±3.1pp: the 1.6pp gap is **3 questions out of
+  250** flipping. A follow-up run at n=800 with a paired McNemar exact test
+  (`scripts/mmlu_significance.py`) put the AWQ+TurboQuant vs fp16 delta at −0.1pp,
+  p=1.00 — as close to a perfect null as this test produces. Don't cite the apparent
+  improvement as a finding; there is no mechanism by which lossy KV compression adds
+  capability.
+- **torchao-int8wo PPL** (21.98) coming in *below* fp16's 22.45 is the same trap in a
+  different metric. Unlike MMLU, perplexity here is deterministic — fixed corpus, no
+  sampling — so the 0.47 difference is a real number, not a sampling artifact. But it is
+  not an *improvement*: weight quantization perturbs every weight, and on any single
+  corpus that perturbation is a coin flip that can nudge PPL a percent or two in either
+  direction. Deterministic ≠ meaningful. The honest reading is "int8wo is
+  quality-neutral on wikitext-2", not "int8wo is better than fp16".
 - **PPL is bit-identical** between fp16 and TurboQuant (22.45 both) because perplexity is
   teacher-forced — every ground-truth token is fed back in, so the KV cache is never read
   during scoring. TurboQuant compresses the KV *cache*; a metric that never reads the

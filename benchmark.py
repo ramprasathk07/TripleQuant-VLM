@@ -44,8 +44,6 @@ from src.reporting.extract import (
 
 # Fixed prompt used for latency / throughput profiling.
 _PERF_PROMPT = "Explain the theory of relativity in simple terms, step by step."
-# Questions per MMLU subject (kept small so the eval stays fast).
-_MMLU_Q_PER_SUBJECT = 50
 
 
 # Helpers
@@ -156,12 +154,18 @@ def _run_quality_llm(runtime, runtime_name: str, config: BenchmarkConfig) -> dic
             out["ppl"] = {"skipped": "ppl needs logits; vLLM unsupported"}
 
     if "mmlu_tiny" in wanted:
-        out["mmlu_acc"] = eval_mmlu_tiny(
+        mmlu = eval_mmlu_tiny(
             runtime,
             config.datasets.mmlu_subjects,
-            num_q_per_subject=_MMLU_Q_PER_SUBJECT,
+            num_q_per_subject=config.datasets.mmlu_num_q_per_subject,
             seed=config.seed,
         )
+        # mmlu_acc stays a bare float — the comparison summary and every existing
+        # results JSON key off it. The counts/stderr ride alongside so a reader can
+        # tell a real delta from sampling noise, and per_question enables a paired
+        # (McNemar) comparison between two models later.
+        out["mmlu_acc"] = mmlu["acc"]
+        out["mmlu_detail"] = mmlu
 
     # ── Reasoning / code / Chinese-MC evals (eval_tasks) ──────────────────────
     # Generative (gsm8k/aime/humaneval) run on ANY runtime via generate(); C-Eval

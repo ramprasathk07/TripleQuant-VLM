@@ -13,16 +13,24 @@ so the CER column that a VLM version of this table would carry becomes PPL/MMLU 
 
 ## The table
 
-| Config | Decode TPS (HF) | Decode TPS (vLLM) | VRAM GB (HF) | PPL Δ vs FP16 | MMLU Δ | Serving |
+| Config | Decode TPS (HF) | Decode TPS (vLLM) | VRAM GB (HF) | PPL Δ vs FP16 | MMLU Δ (paired p) | Serving |
 |---|---|---|---|---|---|---|
-| FP16 baseline | 20.9 | 56.1 | 3.28 | — (22.45) | — (0.548) | ✅ vLLM |
-| llmcompressor AWQ-W4A16 | 4.2 | **57.9** | 1.30 | **+15.36** (37.81) | −0.032 | ✅ vLLM (`compressed-tensors`, Marlin) |
-| llmcompressor GPTQ-W8A8 | 2.8 | 49.3 | 1.95 | +0.27 (22.72) | +0.008 | ✅ vLLM (`compressed-tensors`) |
+| FP16 baseline | 21.5 | 56.1 | 3.28 | — (22.45) | — (0.5337, 427/800) | ✅ vLLM |
+| llmcompressor AWQ-W4A16 | 4.3 | **57.9** | 1.30 | **+15.36** (37.81) | −1.1pp (p=0.53, ns) | ✅ vLLM (`compressed-tensors`, Marlin) |
+| llmcompressor GPTQ-W8A8 | 2.6 | 49.3 | 1.95 | +0.27 (22.72) | +0.9pp (p=0.19, ns) | ✅ vLLM (`compressed-tensors`) |
 | modelopt FP8 | **can't execute**\* | not yet verified† | 1.95 | n/a\* | n/a\* | ⚠️ export fixed, vLLM check blocked (Finding 3) |
 | modelopt NVFP4 | n/a | n/a | n/a | n/a | n/a | ❌ needs Blackwell (sm_100+); not attempted |
 | modelopt → TRT-LLM | n/a | n/a | n/a | n/a | n/a | ❌ no supported TRT-LLM path on this Windows/WSL setup |
-| torchao int4wo | **16.7** | — | **1.47** | +14.02 (36.46) | **−0.132** | HF only (packing-format fix, Finding 5) |
-| AWQ-W4A16 + TurboQuant KV (K3V2) | 4.3 | — | 1.30 | +15.40 (37.85)‡ | −0.024‡ | HF only (TurboQuant not wired into vLLM) |
+| torchao int4wo | **17.3** | — | **1.47** | +14.02 (36.46) | **−9.9pp (p<0.0001)** | HF only (packing-format fix, Finding 5) |
+| AWQ-W4A16 + TurboQuant KV (K3V2) | 4.3 | — | 1.30 | +15.40 (37.85)‡ | −0.1pp (p=1.00, ns) | HF only (TurboQuant not wired into vLLM) |
+
+**"ns" = not significant.** MMLU here is n=800 questions (5 subjects × 200, two subjects
+capped at their 100-row test splits) with a paired McNemar exact test against the FP16
+baseline — every model answers identical questions, so the right comparison is over the
+*discordant* questions, not two independent accuracy figures. Reproduce with
+`python scripts/mmlu_significance.py --dir results/qwen3-1.7b-leaderboard`. **Only
+torchao int4wo's regression is statistically real**; every other MMLU delta in this
+table is noise and must not be reported as a quality finding (see Finding 6).
 
 vLLM runs (FP16/AWQ/GPTQ): 0.11.2 in WSL2 Ubuntu 24.04, eager mode (CUDA graph capture
 disabled — engine init with graphs OOMed the memory-capped VM; eager slightly
@@ -64,18 +72,23 @@ so a reading there measures the knob, not the model).
 
 ## Findings
 
-1. **W4A16 badly hurts a 1.7B model: +15.4 PPL, −3.2pp MMLU.** AWQ-W4A16 at 128
-   calibration samples took Qwen3-1.7B from 22.45 to 37.81 PPL. Small models have less
-   redundancy to absorb 4-bit weight error — consistent with the general observation that
-   aggressive weight quantization punishes small models hardest. A 512-sample calibration
-   re-run was attempted to test whether more calibration data closes the gap; killed after
-   ~2 hours when per-layer smoothing time grew ~50x with the 4x sample count (a real
-   scaling cost of AWQ's per-layer scale search, not a bug) — not worth the GPU time for
-   this leaderboard. Open question, not answered here: does 512-sample AWQ recover some
-   of this quality? If you need 4-bit at this scale, measure calibration size before
-   shipping rather than assuming 128 samples (a common default) is enough.
-2. **W8A8 is the quality-safe choice: +0.27 PPL, MMLU within noise.** GPTQ-W8A8 is
-   near-lossless on both metrics at 60% of fp16's VRAM (1.95 vs 3.28 GB resident).
+1. **W4A16 costs +15.4 PPL on a 1.7B model — but its MMLU drop is *not* significant.**
+   AWQ-W4A16 at 128 calibration samples took Qwen3-1.7B from 22.45 to 37.81 PPL (+68%),
+   a large, unambiguous quality cost on the metric that can resolve it. MMLU tells a
+   different story: −1.1pp, p=0.53 — indistinguishable from noise even at n=800. The
+   discordant breakdown explains why: AWQ changes the answer on **163 of 800 questions**
+   (86 baseline-right→model-wrong, 77 the other way) — it perturbs the model heavily but
+   *symmetrically*, so net accuracy barely moves. Multiple-choice accuracy is simply a
+   blunter instrument than perplexity for detecting this kind of damage. An earlier
+   version of this table reported "−3.2pp MMLU" as a finding at n=250; that was noise
+   (see Finding 6). A 512-sample calibration re-run was attempted to test whether more
+   calibration data closes the PPL gap; killed after ~2h when per-layer smoothing time
+   grew ~50x with the 4x sample count (a real scaling cost of AWQ's per-layer scale
+   search, not a bug). Still open.
+2. **W8A8 is the quality-safe choice: +0.27 PPL, MMLU flat.** GPTQ-W8A8 is near-lossless
+   at 60% of fp16's VRAM (1.95 vs 3.28 GB resident). Its +0.9pp MMLU is not significant
+   (p=0.19) and, notably, it only disturbs **21 of 800 questions** — an order of
+   magnitude fewer than AWQ's 163, which is what "near-lossless" looks like mechanically.
 3. **This repo's modelopt export was broken at both ends — now fixed and verified on
    the HF side.** `mtq.quantize` + plain `save_pretrained` stored simulated-quant weights
    with no quantizer metadata: HF silently loaded plain bf16 (bit-identical PPL was the
@@ -86,22 +99,37 @@ so a reading there measures the knob, not the model).
    correctly identifies it can't execute FP8 (see \* above) rather than silently lying
    about it. vLLM-side confirmation (the actual point of the fix) is blocked by the WSL
    corruption in finding †, above.
-4. **The same checkpoint is 14x slower than fp16 in HF eager and *faster* than fp16 in
-   vLLM.** AWQ-W4A16: 4.2 TPS on HF eager (per-op dequant, no fused kernels) vs 57.9 TPS
+4. **The same checkpoint is 13x slower than fp16 in HF eager and *faster* than fp16 in
+   vLLM.** AWQ-W4A16: 4.3 TPS on HF eager (per-op dequant, no fused kernels) vs 57.9 TPS
    under vLLM's Marlin kernels — edging out even fp16's 56.1. Never benchmark a
    quantized checkpoint on an eager runtime and conclude the format is slow; runtime
    kernels, not the format, decide the speed story. Memory savings, by contrast, are
-   real everywhere (1.30 GB vs 3.28 GB resident on HF).
+   real everywhere (1.30 GB vs 3.28 GB resident on HF). This gap is the concrete
+   motivation for the kernel work laid out in
+   [`docs/kernel_learning_path.md`](kernel_learning_path.md).
 5. **torchao int4wo was stack-gated, not hardware-gated — now fixed.** torchao 0.17's
    v2-default int4 packing formats (`PLAIN`, `PRESHUFFLED`) both require an `mslk>=1.0.0`
    kernel package with no installable release. Probed every `Int4PackingFormat` on this
    GPU/stack; only `TILE_PACKED_TO_4D` (the classic tinygemm kernel) actually runs. Pinned
    it explicitly (`src/runtimes/hf/hf_runtime.py`, `src/quantization/torch_ao.py`) and
-   re-verified: real numbers now (16.7 TPS, 1.47 GB, PPL 36.46). It's also the **worst
-   quality result in the table** (MMLU −0.132, steeper than AWQ-W4A16's −0.032 at a
-   similar bit-width) — torchao's `int4wo` is calibration-free round-to-nearest, with no
-   activation-aware scale search like AWQ's. Cheapest int4 path here, and it shows in the
-   quality column, not just the compression ratio.
+   re-verified: real numbers now (17.3 TPS, 1.47 GB, PPL 36.46). It's also the **only row
+   with a statistically real MMLU regression** (−9.9pp, p<0.0001) — torchao's `int4wo` is
+   calibration-free round-to-nearest, with no activation-aware scale search like AWQ's.
+   The discordance is asymmetric (172 questions broken vs 93 fixed), which is what real
+   degradation looks like next to AWQ's symmetric 86/77 churn. Interesting tension: it's
+   the *fastest* quantized row in HF eager (17.3 TPS vs AWQ's 4.3 — no per-group dequant
+   bookkeeping) and the worst quality. Cheap in every sense.
+6. **Most of the quality deltas in the first version of this table were noise, including
+   one I reported as a finding.** The original MMLU used n=250 (5 subjects × 50), where
+   the binomial SE is ±3.1pp — so a "+0.8pp improvement" was literally 2 questions out of
+   250 flipping, and even the "−3.2pp AWQ regression" I wrote up was ~1 SE. Two fixes
+   landed: `eval_mmlu_tiny` now returns counts, stderr, and per-question outcomes instead
+   of a bare float (a bare accuracy hides its own sample size, which is what made this
+   invisible), and `scripts/mmlu_significance.py` runs the paired McNemar exact test that
+   this comparison always needed. Re-run at n=800: only int4wo survives. **If a quantized
+   model appears to beat its own baseline on a benchmark, that is the null hypothesis
+   presenting itself, not a discovery** — quantization removes information; it does not
+   add capability.
 
 ## Reproduce
 

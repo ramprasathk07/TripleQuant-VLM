@@ -18,6 +18,12 @@ tracking:
 datasets:
   ppl_dataset: wikitext
   ppl_subset:  wikitext-2-raw-v1
+  # 200/subject over 5 subjects -> n ~800 (two subjects only have 100 test rows).
+  # At the old n=250 the binomial SE was 3.1pp, so every sub-2pp "quality delta"
+  # in the leaderboard was indistinguishable from noise. Raised here, and
+  # per-question outcomes are now recorded so the *paired* McNemar test
+  # (scripts/mmlu_significance.py) can resolve deltas this still can't.
+  mmlu_num_q_per_subject: 200
 
 latency:
   batch_sizes:  [1]           # single-stream decode TPS is the table's column

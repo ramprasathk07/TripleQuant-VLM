@@ -167,11 +167,19 @@ def eval_mmlu_tiny(
     subject_list: list[str],
     num_q_per_subject: int = 100,
     seed: int = 42,
-) -> float:
+) -> dict:
     """Evaluate LLM accuracy on MMLU multiple-choice questions.
 
     For each question, scores the log-probability of each answer choice (A, B, C, D)
     under the model, selects the highest-scoring choice, and compares to the gold label.
+
+    Returns counts and per-question outcomes alongside the accuracy, not just the
+    ratio: accuracy alone hides the sample size, and a bare number invites reading
+    a 1pp difference between two models as a real quality difference when at
+    n=250 the 95% CI is +/-6pp. ``per_question`` (subject + index + hit/miss, in a
+    seed-fixed deterministic order) makes the *paired* comparison possible — two
+    models see identical questions, so McNemar's test on the discordant pairs is
+    far more sensitive than comparing two independent accuracy figures.
 
     Args:
         runtime: Runtime with forward_logits() (HFRuntime) or score_choices() method.
@@ -180,11 +188,19 @@ def eval_mmlu_tiny(
         seed: Random seed for reproducible subject/question sampling.
 
     Returns:
-        Accuracy as a float (0.0-1.0).
-        Accuracy in [0, 1]. Higher is better.
+        {
+          "acc": float,            # correct / total, in [0, 1]. Higher is better.
+          "correct": int,
+          "total": int,
+          "stderr": float,         # binomial SE of acc; ~half-width/1.96 of the 95% CI
+          "per_subject": {subject: {"correct": int, "total": int}},
+          "per_question": [{"subject": str, "i": int, "hit": bool}],
+        }
     """
     correct = 0
     total   = 0
+    per_subject: dict[str, dict[str, int]] = {}
+    per_question: list[dict] = []
 
     #Need progress bar with proper label
     for subject in subject_list:
@@ -195,21 +211,36 @@ def eval_mmlu_tiny(
             logger.warning(f"Could not load MMLU subject '{subject}': {e}")
             continue
 
-        for row in ds:
+        s_correct = s_total = 0
+        for i, row in enumerate(ds):
             prompt  = _format_mmlu_prompt(row)
             gold_idx = int(row["answer"])          # 0-indexed int in MMLU
             gold_label = _CHOICE_LABELS[gold_idx]
 
             pred_label = _score_mmlu_choices(runtime, prompt)
 
-            if pred_label == gold_label:
+            hit = pred_label == gold_label
+            if hit:
                 correct += 1
+                s_correct += 1
             total += 1
+            s_total += 1
+            per_question.append({"subject": subject, "i": i, "hit": hit})
+
+        per_subject[subject] = {"correct": s_correct, "total": s_total}
 
     if total == 0:
         raise ValueError("No MMLU questions were evaluated.")
 
-    return correct / total
+    acc = correct / total
+    return {
+        "acc": acc,
+        "correct": correct,
+        "total": total,
+        "stderr": math.sqrt(acc * (1 - acc) / total),
+        "per_subject": per_subject,
+        "per_question": per_question,
+    }
 
 
 def _format_mmlu_prompt(row: dict) -> str:
@@ -369,10 +400,12 @@ def run_llm_eval(
     wiki_ds = load_wikitext(split="test", num_samples=ppl_num_samples)
     results["ppl"] = compute_ppl(runtime, wiki_ds)
 
-    # MMLU
-    results["mmlu_acc"] = eval_mmlu_tiny(
+    # MMLU — keep mmlu_acc a bare float for callers/summaries; detail rides alongside.
+    _mmlu = eval_mmlu_tiny(
         runtime, subject_list, num_q_per_subject=num_q_per_subject
     )
+    results["mmlu_acc"] = _mmlu["acc"]
+    results["mmlu_detail"] = _mmlu
 
     # KL divergence (optional)
     if baseline_logits_dict:

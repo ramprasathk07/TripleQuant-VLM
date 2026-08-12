@@ -95,5 +95,9 @@ QK-V) is fully designed but not implemented:
 - Full kernel-by-kernel priority/difficulty/speedup survey, plus a Triton-vs-TileLang
   decision framework and TileLang learning path:
   [`notes/kernel_scope.md`](../notes/kernel_scope.md).
+- **Where to start if you're new to kernels**:
+  [`docs/kernel_learning_path.md`](kernel_learning_path.md) — the same material ordered
+  easiest-to-hardest, with what each kernel actually does and where it plugs into this
+  repo, anchored to the measured 13x HF-eager-vs-vLLM gap rather than generic advice.
 
 Status tracked in `failure_cases.md` #8 and the README roadmap.
