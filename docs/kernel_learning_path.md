@@ -21,16 +21,16 @@ checkpoint**:
 
 | Runtime | Decode TPS |
 |---|---|
-| HF eager (no fused kernels) | 4.2 |
+| HF eager (no fused kernels) | 4.3 |
 | vLLM (Marlin int4 kernels) | **57.9** |
 
-**14x, same weights, same GPU.** The only difference is that vLLM has a kernel that
+**13.6x, same weights, same GPU.** The only difference is that vLLM has a kernel that
 keeps the weights packed in registers and dequantizes inline, while HF eager
 materializes a dequantized bf16 tensor for every matmul and pays a full HBM round-trip
 for it. That gap *is* the value of kernel work, measured on this box.
 
 The second motivating number: TurboQuant gets **4x context length** (16,384 vs 4,096
-tokens) but runs at 4.3 TPS vs fp16's 20.9. The memory win is real and already banked;
+tokens) but runs at 4.3 TPS vs fp16's 21.5. The memory win is real and already banked;
 the speed cost is entirely because the KV codec runs as unfused PyTorch ops.
 
 ---
@@ -49,7 +49,7 @@ HBM (VRAM)  ~360 GB/s   <- RTX 3060. This is the bottleneck.
 ```
 A fused kernel is fast because it reads HBM *once* and does all its work in the top
 three tiers. An unfused sequence of PyTorch ops reads and writes HBM between every
-step. That's the entire mechanism behind the 14x above.
+step. That's the entire mechanism behind the 13.6x above.
 
 **2. Arithmetic intensity and the roofline.** FLOPs ÷ bytes moved. Decode at batch=1 is
 extremely low intensity — one token's worth of math against the *whole* weight matrix
@@ -98,7 +98,7 @@ of exactly this. Write the simple one first.
 ## Level 2 — Dequantization kernel ⭐ first genuinely useful one (~1 week)
 
 **What we're doing:** taking packed int4/int8 weights + per-group scales and producing
-bf16 — the operation that makes our AWQ checkpoint 14x slower in eager mode than under
+bf16 — the operation that makes our AWQ checkpoint 13.6x slower in eager mode than under
 vLLM.
 
 Concretely, a W4A16 weight is stored as:
@@ -195,7 +195,7 @@ One pass, mathematically identical result. Full version with the TurboQuant-spec
 value-side gather is in [`notes/turboquant.md`](../notes/turboquant.md) §5.2 Kernel C.
 
 **Why it's the prize:** this is what converts TurboQuant's *memory* win (already
-measured: 4x context) into a *speed* win. Current TQ decode is 4.3 TPS vs fp16's 20.9
+measured: 4x context) into a *speed* win. Current TQ decode is 4.3 TPS vs fp16's 21.5
 because every step runs unfused. Target from `kernel_scope.md`: ≥1.2x FP16 at ctx=32K
 while using ≥3x less KV VRAM.
 
@@ -243,6 +243,6 @@ covers the reasoning for deferring each.
 ## Suggested first move
 
 Level 0 → Level 1 → **Level 2 stopping at the standalone dequant benchmark**. That
-single experiment reproduces the 14x gap from our leaderboard with code you wrote
+single experiment reproduces the 13.6x gap from our leaderboard with code you wrote
 yourself, and it's the cheapest path from "I read about memory-bound kernels" to "I
 measured one." Everything after that is a matter of degree.

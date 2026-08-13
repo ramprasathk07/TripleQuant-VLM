@@ -23,12 +23,12 @@ AWQ-W4A16 produced by `llm-compressor` — loaded two ways:
 
 | Checkpoint | HF eager | vLLM | Ratio |
 |---|---|---|---|
-| FP16 baseline | 21.5 tok/s | 56.0 tok/s | 2.6x |
-| **AWQ-W4A16** | **4.2 tok/s** | **57.9 tok/s** | **13.7x** |
-| GPTQ-W8A8 | 2.6 tok/s | 49.3 tok/s | 19.0x |
+| FP16 baseline | 21.5 tok/s | 56.1 tok/s | 2.6x |
+| **AWQ-W4A16** | **4.3 tok/s** | **57.9 tok/s** | **13.6x** |
+| GPTQ-W8A8 | 2.6 tok/s | 49.3 tok/s | 18.8x |
 
 Look at the AWQ row twice. Under HF eager it's **5x slower than the FP16 model it was
-supposed to accelerate**. Under vLLM it's *faster than FP16* — 57.9 vs 56.0.
+supposed to accelerate**. Under vLLM it's *faster than FP16* — 57.9 vs 56.1.
 
 ---
 

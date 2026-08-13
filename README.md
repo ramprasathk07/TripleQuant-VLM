@@ -20,11 +20,11 @@ same format with `python report.py --dir results/<run_name>`.
 
 **One model, every quantization path, HF + vLLM serving, one table:**
 [`docs/qwen3_1_7b_leaderboard.md`](docs/qwen3_1_7b_leaderboard.md) — including two real
-bugs found and fixed along the way (a torchao int4 kernel-packing gap, a ModelOpt export
-that silently dropped quant metadata) and one still open (vLLM verification of the fixed
-FP8 export, blocked on a WSL disk repair, documented rather than hidden). Headline: the
-same AWQ-W4A16 checkpoint runs 4.2 TPS on HF eager and 57.9 TPS under vLLM's Marlin
-kernels — faster than fp16.
+bugs found and fixed along the way: a torchao int4 kernel-packing gap, and a ModelOpt
+export that silently dropped quant metadata (fix verified by vLLM's error moving from
+"cannot find the config file" to a hardware-capability rejection — the checkpoint is
+correct, the GPU is simply pre-Ada). Headline: the same AWQ-W4A16 checkpoint runs 4.3 TPS
+on HF eager and 57.9 TPS under vLLM's Marlin kernels — faster than fp16.
 
 | Model | TTFT (ms) | TPOT (ms) | VRAM (MB) | PPL | MMLU |
 |---|---|---|---|---|---|
