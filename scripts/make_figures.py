@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate the figures used by docs/blog/*.md.
+"""Generate the result figures used by README.md (and the local write-ups).
 
 Every number here is read from the committed results JSON, never typed in by hand —
 so a re-run of the benchmarks regenerates correct figures, and a figure can never
@@ -10,7 +10,7 @@ dataviz validator: lightness band, chroma floor, CVD separation, normal-vision f
 contrast). Bars/points carry direct labels because two of the light-mode hues sit
 below 3:1 against the surface — identity is never color-alone.
 
-Usage:  python scripts/make_blog_plots.py [--outdir docs/blog/plots]
+Usage:  python scripts/make_figures.py [--outdir assets]
 """
 from __future__ import annotations
 
@@ -226,7 +226,7 @@ def fig_metric_sensitivity(results_dir: Path, out: Path, run_ts: str) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Generate blog figures from results JSON")
-    p.add_argument("--outdir", default="docs/blog/plots")
+    p.add_argument("--outdir", default="assets")
     p.add_argument("--run-ts", default="20260812T125040Z",
                    help="leaderboard run timestamp to read MMLU detail from")
     args = p.parse_args()

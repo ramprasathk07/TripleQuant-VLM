@@ -21,7 +21,7 @@ class CacheConfig:
         use_qjl:       If True, reconstruct keys with the QJL residual term. This
                        is an unbiased *inner-product* estimator and adds variance
                        to point-wise reconstruction — leave False (MSE-only) for
-                       generation quality. See notes/turboquant_kv_case_studies.md.
+                       generation quality (low-bit keys suffer from outlier channels).
         use_compressed_store: If True, attention reads the decompressed overflow
                        store (TQ in the decode loop). If False, only the exact
                        ring is read (a sliding window; TQ measured for storage only).

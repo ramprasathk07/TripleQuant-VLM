@@ -230,3 +230,8 @@ models/hub/
 
 # Wandb / experiment tracking
 wandb/
+
+# Private working notes and write-ups — kept local, not published.
+notes/
+work/
+docs/

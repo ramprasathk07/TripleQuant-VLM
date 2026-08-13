@@ -131,7 +131,7 @@ def render_markdown(data: ReportData, verdicts: dict, plot_paths: dict[str, str]
         parts.append(
             "Next-token agreement with the FP16 baseline, per KV bit-width, at the "
             "compressed-tail positions (the ring buffer's most recent tokens stay "
-            "exact regardless of bit-width — see `docs/failure_cases.md`).\n"
+            "exact regardless of bit-width).\n"
         )
         parts.append(f"![TurboQuant bits tradeoff]({plot_paths['tq_bits']})\n")
         tbl = _tq_bits_table(data.detail_records)

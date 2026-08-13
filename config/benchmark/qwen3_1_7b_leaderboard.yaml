@@ -1,5 +1,5 @@
 # Qwen3-1.7B leaderboard sweep — every quantization config in one table.
-# Feeds docs/qwen3_1_7b_leaderboard.md: Decode TPS / VRAM / PPL+MMLU delta vs FP16 / serving.
+# Decode TPS / VRAM / PPL + MMLU delta vs FP16 / serving compatibility.
 # HF runtime numbers here; vLLM serving numbers come from the WSL env (scripts/wsl_vllm_bench).
 run_name: qwen3-1.7b-leaderboard
 output_root: ./results

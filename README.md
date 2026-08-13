@@ -10,75 +10,87 @@ ships **TurboQuant**, a from-scratch KV-cache compression scheme (random rotatio
 Lloyd-Max codebook), because weight quantization alone doesn't touch the thing that
 actually runs out first at long context: the KV cache.
 
+Every number below was measured by this repo on one machine. Nothing is imported from a
+paper or a vendor benchmark.
+
 ---
 
-## Results
+## Results — Qwen3-1.7B on an RTX 3060 (12 GB)
 
-Qwen3-1.7B, RTX 3060 (12GB). Full report with methodology and every metric:
-[`docs/benchmark_report.md`](docs/benchmark_report.md) — regenerate any sweep into the
-same format with `python report.py --dir results/<run_name>`.
+**Environment:** RTX 3060 12 GB (sm_86, Ampere) · driver 610.62 · CUDA 12.8 ·
+torch 2.8.0+cu128 · transformers 4.55.4 · vLLM 0.11.2 (WSL2) · Windows 10.
 
-**One model, every quantization path, HF + vLLM serving, one table:**
-[`docs/qwen3_1_7b_leaderboard.md`](docs/qwen3_1_7b_leaderboard.md) — including two real
-bugs found and fixed along the way: a torchao int4 kernel-packing gap, and a ModelOpt
-export that silently dropped quant metadata (fix verified by vLLM's error moving from
-"cannot find the config file" to a hardware-capability rejection — the checkpoint is
-correct, the GPU is simply pre-Ada). Headline: the same AWQ-W4A16 checkpoint runs 4.3 TPS
-on HF eager and 57.9 TPS under vLLM's Marlin kernels — faster than fp16.
+### The headline: the runtime decides quantization's speed, not the format
 
-| Model | TTFT (ms) | TPOT (ms) | VRAM (MB) | PPL | MMLU |
+![Same checkpoint, two runtimes](assets/runtime_gap.png)
+
+| Config | Decode TPS (HF eager) | Decode TPS (vLLM) | VRAM (GB) | PPL | MMLU (n=800) |
 |---|---|---|---|---|---|
-| fp16 baseline | 51.5 | 49.4 | 3,282 | 22.45 | 0.548 |
-| torchao int8wo | 70.2 | 66.1 | 2,250 (-31%) | 21.98 | 0.556 |
-| TurboQuant K3V2 | 71.4 | 40.6 | 3,290\* | 22.45 | 0.564\* |
+| FP16 baseline | 21.5 | 56.1 | 3.28 | 22.45 | 0.5337 |
+| llmcompressor AWQ-W4A16 | 4.3 | **57.9** | 1.30 | 37.81 (+15.4) | 0.5225 (−1.1pp, ns) |
+| llmcompressor GPTQ-W8A8 | 2.6 | 49.3 | 1.95 | 22.72 (+0.27) | 0.5425 (+0.9pp, ns) |
+| modelopt FP8 | can't execute¹ | can't execute¹ | 1.95 | — | — |
+| torchao int4wo | 17.3 | — | 1.47 | 36.46 (+14.0) | 0.4350 (**−9.9pp, real**) |
+| AWQ-W4A16 + TurboQuant KV | 4.3 | — | 1.30 | 37.85 (+15.4)² | 0.5325 (−0.1pp, ns) |
 
-\* *Short-context snapshot — see below, this metric is measuring the wrong thing for a
-KV-cache technique. \* MMLU delta is noise (small sample), not a real quality difference —
-[explained in the report](docs/benchmark_report.md).*
+The **same AWQ-W4A16 checkpoint** runs at 4.3 tok/s under HuggingFace eager and 57.9
+tok/s under vLLM — **13.6x, weights unchanged**, and faster than FP16 itself. Eager mode
+dequantizes to a bf16 tensor and writes it back to HBM for every matmul, spending exactly
+the bandwidth the 4-bit weights saved; vLLM's Marlin kernels fuse dequantization into the
+matmul so the bf16 tensor is never materialized. **Never conclude a format is slow from
+an eager-mode benchmark** — you measured your runtime's kernel coverage.
 
-**The number that matters for a KV-cache codec isn't short-context VRAM — it's how far
-context can grow before the cache exhausts the GPU, at a bit-width whose output you'd
-actually ship:**
+Memory savings, by contrast, are real on both runtimes (1.30 GB vs 3.28 GB).
+
+¹ *FP8 needs compute capability sm_89 (Ada); this box is sm_86. The checkpoint exports
+correctly — verified by vLLM's error moving from "cannot find the config file for
+modelopt" (a repo bug, since fixed) to a hardware-capability rejection. NVFP4 needs
+Blackwell. TensorRT-LLM has no supported path on this Windows/WSL setup.*
+² *Teacher-forced PPL cannot observe KV-cache quantization — see "What the metrics can
+and can't see" below.*
+
+### "ns" means the difference is not statistically significant
+
+MMLU here is 800 questions with a paired **McNemar exact test** against the FP16
+baseline — every model answers identical questions, so the discordant pairs are the
+signal, not two independent accuracy figures.
+
+![MMLU deltas with confidence intervals](assets/mmlu_significance.png)
+
+| Model | Δ | broken / fixed | p | |
+|---|---|---|---|---|
+| GPTQ-W8A8 | +0.9pp | 7 / 14 | 0.19 | noise |
+| AWQ + TurboQuant | −0.1pp | 80 / 79 | 1.00 | noise |
+| AWQ-W4A16 | −1.1pp | 86 / 77 | 0.53 | noise |
+| torchao int4wo | −9.9pp | 172 / 93 | **<0.0001** | real |
+
+The discordant counts are more informative than the deltas. AWQ changes **163 of 800
+answers** but *symmetrically* (86 broken, 77 fixed) — heavy perturbation, no net accuracy
+change. int4wo changes 265 *asymmetrically* (172/93) — genuine degradation. Same "4-bit
+weights" label, different mechanism. Reproduce with:
+
+```bash
+python scripts/mmlu_significance.py --dir results/qwen3-1.7b-leaderboard
+```
+
+### TurboQuant: 4x context, at a bit-width that preserves quality
 
 | Model | Max context, this GPU | Top-1 agreement vs FP16 @16K |
 |---|---|---|
 | fp16 baseline | 4,096 tokens | — (reference) |
-| torchao int8wo | 4,096 tokens (same bucket as fp16 — see note) | n/a (weight-only) |
+| torchao int8wo | 4,096 tokens | n/a (weight-only) |
 | **TurboQuant K8V8** | **16,384 tokens (4x)** | **0.918 — quality preserved** |
 | TurboQuant K3V2 | 16,384 tokens | 0.193 — fits, but output diverges badly |
 
-![Peak VRAM vs context length](docs/plots/ctx_sweep.png)
+![Peak VRAM vs context length](assets/ctx_sweep.png)
 
-**Read the two TurboQuant rows together — that contrast is the actual finding.** Both
-bit-widths reach 4x fp16's context, so capacity alone doesn't distinguish them; the
-agreement column does. K8V8 keeps 92% next-token agreement with FP16 at 16K while
-compressing the KV cache 1.73x — that's the setting worth shipping. K3V2 compresses 4.81x
-but agrees only ~19% of the time *at every context length* (not a long-context problem —
-it's equally poor at 512), which makes its extra compression worthless. Earlier versions
-of this table led with K3V2 and reported the 4x capacity without any quality measurement
-behind it; that was the wrong default to showcase, and it took an explicit
-accuracy-vs-context sweep to catch (`docs/failure_cases.md` #10).
+**Read the two TurboQuant rows together — that contrast is the finding.** Both reach 4x
+fp16's context, so capacity alone doesn't distinguish them; the agreement column does.
+K8V8 keeps 92% next-token agreement while compressing the KV cache 1.73x — the setting
+worth shipping. K3V2 compresses 4.81x, buys *no additional context*, and gives up ~80% of
+fidelity.
 
-*Measurement note:* "max context" here is the longest sequence a single full-prefill
-forward pass fits in 12 GB. That probe's peak is dominated by the all-position logits
-tensor, not the KV cache, so these are **relative** numbers under an identical probe (only
-the KV codec differs), not a serving capacity figure — real serving chunks prefill and
-keeps only the last position's logits.
-
-Note: torchao's smaller resident-weight footprint does buy real headroom at every
-matched context length (e.g. 5,324 MB vs fp16's 6,364 MB at 4,096 tokens) — it just isn't
-enough to survive the *next* doubling step in this sweep's grid (512/1024/.../16384): both
-land over the 12,288 MB card's capacity at 8,192 tokens (torchao 13,134 MB, fp16
-14,174 MB). A finer-grained sweep would likely find torchao's true ceiling somewhere
-between 4,096 and 8,192, higher than fp16's — but that hasn't been measured, so it isn't
-claimed here. TurboQuant's KV compression is a different kind of win (bytes-per-token
-that shrinks with the codec, not a fixed offset), which is why it's the only one crossing
-multiple doubling steps.
-
-The full bit-width tradeoff, measured at 512 comparison positions per point across
-context 512→16,384 (SE ~1-3pp):
-
-![TurboQuant bits tradeoff](docs/plots/tq_bits_tradeoff.png)
+![TurboQuant bits tradeoff](assets/tq_bits_tradeoff.png)
 
 | Bits | Top-1 agreement (512 → 16K) | KV compression @16K |
 |---|---|---|
@@ -87,13 +99,45 @@ context 512→16,384 (SE ~1-3pp):
 | K4V4 | 0.402 → 0.307 | 3.02x |
 | **K8V8** | **0.981 → 0.918** | 1.73x |
 
-Two things this says. First, **the cliff is between K4V4 and K8V8**, not gradual —
-everything below 8 bits lands under 40% agreement, so the "aggressive compression" band
-is mostly unusable on this model. Second, **agreement doesn't systematically decay with
-context** at any bit-width: K3V2 is as poor at 512 as at 16K. Long context isn't what
-breaks it; the bit budget is. Root cause (per-vector key quantization vs. outlier
-channels) and the real fix (per-channel keys, KIVI-style) in
-[`docs/failure_cases.md`](docs/failure_cases.md#2-turboquants-default-k3v2-has-weak-next-token-agreement-at-low-bit-widths).
+Two further results: **the cliff is between K4V4 and K8V8**, not gradual — everything
+below 8 bits lands under 40% agreement, so the aggressive-compression band is mostly
+unusable on this model. And **agreement doesn't decay with context** at any bit-width
+(K3V2 is as poor at 512 as at 16K) — the constraint is the bit budget, not long context.
+
+Root cause of the low-bit collapse: keys are quantized per-vector with one global
+codebook, but transformer keys have large-magnitude outlier *channels*. The known fix is
+per-channel key quantization (KIVI-style) — a quantizer redesign, not done here.
+
+*Measurement caveat:* "max context" is the longest sequence a single full-prefill forward
+pass fits in 12 GB, and that peak is dominated by the all-position logits tensor rather
+than the KV cache. Valid as a **relative** comparison under an identical probe (only the
+KV codec differs); not a serving-capacity figure.
+
+---
+
+## What the metrics can and can't see
+
+Three claims in earlier versions of this README were wrong — not miscalculated, but
+*structurally unsupported*. Each is worth knowing before you trust any quantization
+benchmark, including this one.
+
+1. **Teacher-forced perplexity cannot observe KV-cache quantization.** PPL scores a whole
+   sequence in one forward pass; the cache is written and never read back across steps.
+   A compressed and uncompressed model scored bit-identical PPL to 16 decimals here —
+   that was the metric being blind, not the codec being lossless. Use generation-based
+   agreement instead.
+2. **An accuracy ratio without its sample size is unfalsifiable.** MMLU was originally
+   n=250 (SE ±3.1pp), so "quantization improved accuracy" was 2–3 questions flipping. The
+   eval now returns `{acc, correct, total, stderr, per_question}` and the count is
+   config-driven.
+3. **A memory probe says nothing about output quality.** The "4x context" number came from
+   a capacity sweep with no accuracy field at all, while the quality sweep stopped at
+   4,096 — below the claim. The two axes never overlapped. Extending quality measurement
+   to 16,384 is what revealed K8V8, not K3V2, as the shippable setting.
+
+Common structure: **a metric that couldn't see what it was being used to claim.** If a
+quantized model appears to beat its own baseline, that's the null hypothesis, not a
+discovery.
 
 ---
 
@@ -126,10 +170,11 @@ static codebook is cached and reused globally.
 **3. QJL 1-bit residual correction (available, off by default).** Projects the
 quantization residual `r = x - x̂_MSE` through a random Gaussian sketch `S`, packs
 `sign(Sr)` (1 bit/coordinate), and stores `‖r‖₂` as one fp16 scalar. In principle this
-makes the inner-product estimate unbiased — in practice it's **off by default**: it's
-algebraically identical to dequantize-then-matmul for a fixed `S`
-([measured, not assumed](docs/failure_cases.md#3-qjl-1-bit-residual-correction-doesnt-help-in-practice)),
-so the extra bit buys nothing at this implementation's fixed-`S` design point.
+makes the inner-product estimate unbiased — in practice it is **off by default**, because
+measurement showed it produces *identical* scores to dequantize-then-matmul: the two are
+algebraically equivalent for a fixed projection `S`, and QJL's benefit is variance
+reduction in expectation over *resampled* `S`. This implementation fixes `S` once for
+speed, so the extra bit buys nothing.
 
 **4. Fused attention score (no materialization).** The query is rotated once
 (`q_rot = q·Π`); the score for a cached key is a streaming dot product against packed
@@ -139,57 +184,39 @@ $$\text{score} = \|k\|_2 \sum_{j=1}^d q_{\text{rot}}[j] \cdot \text{codebook}[id
 
 — so a fused kernel could stream packed indices from HBM, gather centroids, and
 accumulate in SRAM without ever writing a dequantized vector back to memory. **Not yet
-built** — every number above runs on the unfused PyTorch reference path (5-10x slower
-than a fused kernel would be). Kernel design (Triton, math + pseudocode for all four
-candidate kernels) is scoped in [`notes/turboquant.md`](notes/turboquant.md) §5 and
-[`notes/kernel_scope.md`](notes/kernel_scope.md); an ordered, easiest-first ramp through
-that material is in
-[`docs/kernel_learning_path.md`](docs/kernel_learning_path.md).
-
-Design docs: [`notes/turboquant.md`](notes/turboquant.md) (algorithm),
-[`notes/turboquant_hf_cache_guide.md`](notes/turboquant_hf_cache_guide.md) (HF
-integration architecture), [`notes/debugging_turboquant_kv.md`](notes/debugging_turboquant_kv.md)
-(the methodology behind getting it correct — nine bugs, each with the general lesson).
+built** — every TurboQuant latency number above runs on the unfused PyTorch reference
+path, 5–10x slower than a fused kernel would be. The memory results are unaffected.
 
 ---
 
 ## Decision Matrix
 
-What's actually implemented and measured in this repo — not a hypothetical feature list.
+What's actually implemented and measured here — not a hypothetical feature list.
 
 | Need | Use | Why |
 |---|---|---|
-| Longest context on fixed VRAM | **TurboQuant** (tune key/value bits) | KV cache is what runs out first at long context; weight quantization doesn't touch it. See the tradeoff curve above before picking a bit-width. |
-| Smallest resident weight footprint, simplest setup | **torchao int8wo** | One dependency, on-the-fly or offline, -31% VRAM on Qwen3-1.7B with quality within noise of fp16. |
-| Broadest quantization scheme coverage (FP8, NVFP4, MXFP4) | **ModelOpt** | The only backend here targeting Blackwell-generation formats; also the AWQ/PTQ path with per-layer `quant_cfg`. |
-| Production serving throughput, widest deployment support | **llm_compressor → vLLM** (`compressed-tensors` format) | AWQ/GPTQ/PTQ/SmoothQuant, native vLLM loading, no export step. |
-| VLM / OCR workload | **llm_compressor or ModelOpt**, either backend | Both auto-exclude vision-tower modules from calibration (`_get_vision_ignore_patterns` in `BaseQuantizer`) — quantizing the vision tower degrades image understanding badly, so neither backend does it. |
-| Maximum accuracy, no compression needed | **fp16 baseline** | The reference point every other row is measured against. |
-
----
+| Longest context on fixed VRAM | **TurboQuant K8V8** | KV cache is what runs out first at long context; weight quantization doesn't touch it. Check the bit-width tradeoff above before going below 8 bits. |
+| Smallest resident weight footprint, simplest setup | **torchao int8wo** | One dependency, on-the-fly or offline, −31% VRAM with quality within noise of fp16. |
+| Broadest scheme coverage (FP8, NVFP4, MXFP4) | **ModelOpt** | The only backend here targeting Blackwell-generation formats; also an AWQ/PTQ path with per-layer `quant_cfg`. Needs Ada+ to actually serve FP8. |
+| Production serving throughput | **llm_compressor → vLLM** (`compressed-tensors`) | AWQ/GPTQ/PTQ/SmoothQuant, native vLLM loading with fused kernels, no export step. This is where quantization actually pays. |
+| VLM / OCR workload | **llm_compressor or ModelOpt** | Both auto-exclude vision-tower modules from calibration — quantizing the vision tower degrades image understanding badly. |
+| Maximum accuracy | **fp16 baseline** | The reference every other row is measured against. |
 
 ## Compatibility Matrix
 
 | Backend | HF runtime | vLLM | Notes |
 |---|---|---|---|
 | `llm_compressor` | ✅ | ✅ (`--quantization compressed-tensors`) | AWQ, GPTQ, PTQ, SmoothQuant |
-| `modelopt` | ✅ | ✅ (`--quantization modelopt` / `modelopt_fp4`) | AWQ, PTQ; FP8/NVFP4/MXFP4 family |
-| `torchao` | ✅ | ❌ not wired | Offline checkpoint uses `safe_serialization=False` (tensor subclasses) — no vLLM loader path built for this |
-| TurboQuant (KV cache) | ✅ (single-sequence decode) | ❌ not integrated | A draft vLLM adapter existed but never imported cleanly; removed in cleanup (recoverable from git history) — v2 parking lot |
-
-The vLLM *serving* commands above (`vllm serve ... --quantization ...`) are vLLM's own
-documented capability for these checkpoint formats. Separately, this repo's own
-`benchmark.py` vLLM **runtime** class (`src/runtimes/vllm/`) exists and is
-dual-runtime-aware by design, but hasn't been exercised end-to-end on this project's
-Windows dev box — vLLM needs [a separate environment](#installation) here, and that
-combined run is still open. Track it in [`docs/failure_cases.md`](docs/failure_cases.md).
+| `modelopt` | ✅ | ✅ (`--quantization modelopt` / `modelopt_fp4`) | AWQ, PTQ; FP8/NVFP4/MXFP4. FP8 serving needs sm_89+ |
+| `torchao` | ✅ | ❌ not wired | Offline checkpoint uses `safe_serialization=False` (tensor subclasses) — no vLLM loader path built |
+| TurboQuant (KV cache) | ✅ (single-sequence decode) | ❌ not integrated | v2 item; would need a vLLM attention backend |
 
 ---
 
 ## Architecture
 
-Model compression (quantization) is decoupled from runtime evaluation (benchmarking)
-through a modular, registry-based codebase.
+Model compression is decoupled from runtime evaluation through a modular,
+registry-based codebase.
 
 * **Configuration** (`src/config/`) — Pydantic v2 schemas validate quantization and
   benchmark YAML before any model loads.
@@ -197,16 +224,13 @@ through a modular, registry-based codebase.
   (`llm_compressor`, `modelopt`, `torchao`, `fp16` baseline) register via decorator and
   resolve dynamically from `backend` in the config.
 * **Runtime abstraction** (`src/runtimes/`) — HF and vLLM under one interface, so the
-  same prompts run through both to compare reference quality against production
-  performance.
-* **Evaluation** (`src/evaluation/`) — language-model metrics (perplexity, MMLU-tiny,
-  logit-KL, token agreement) and VLM/OCR metrics (CER, WER, exact-match, BLEU).
-* **TurboQuant** (`src/turboquant_v1/`) — the KV-cache compression extension described
-  above.
+  same prompts run through both.
+* **Evaluation** (`src/evaluation/`) — LLM metrics (perplexity, MMLU with per-question
+  detail, logit-KL, token agreement) and VLM/OCR metrics (CER, WER, exact-match, BLEU).
+* **TurboQuant** (`src/turboquant_v1/`) — the KV-cache compression extension above.
 * **Reporting** (`src/reporting/`) — turns `results/*.json` into `report.md` + charts +
-  BEST-FOR verdicts. `python report.py --dir results/<run_name>`.
-* **Tracking** (`src/tracking/`) — W&B + TensorBoard, additive to local JSON (always
-  written regardless of tracking config).
+  BEST-FOR verdicts.
+* **Tracking** (`src/tracking/`) — W&B + TensorBoard, additive to local JSON.
 
 ### Model Quantization Pipeline
 
@@ -223,7 +247,7 @@ graph TD
     H --> I["Compile Quantization Recipe & Ignore List"]
     I --> J{"Backend Dispatch"}
     J -- "llm_compressor" --> K["oneshot() Calibration Loop"]
-    J -- "modelopt" --> L["mtq.quantize() Calibration Loop"]
+    J -- "modelopt" --> L["mtq.quantize() + export_hf_checkpoint"]
     J -- "torchao" --> L2["quantize_() In-Place"]
     K --> M["CPU Offloading & Compressed Export"]
     L --> M
@@ -233,34 +257,23 @@ graph TD
 
 ### Dual-Runtime Benchmarking & Capability Gating
 
-Evaluation runs are isolated in subprocesses for crash safety and clean GPU memory
-between models. Metric routing respects runtime capabilities.
+Evaluation runs are isolated for crash safety and clean GPU memory between models.
+Metric routing respects runtime capabilities — perplexity needs raw logits (HF only),
+OCR needs VLM inference, perf/memory run on both.
 
 ```mermaid
 graph TD
-    A["Benchmark CLI (benchmark.py)"] --> B["Load YAML Config"]
-    B --> C["Filter Models by GPU Architecture (skip_on)"]
-    C --> D["Sequential Subprocess Evaluation Loop"]
-    D --> E["Load Model & Runtime (Isolate OOMs)"]
-    E --> F{"Select Runtime"}
-    F -- "Hugging Face (hf)" --> G["HF Runtime Executor"]
-    F -- "vLLM (vllm)" --> H["vLLM Runtime Executor"]
-    G --> I["Text Perplexity (PPL)"]
-    G --> J["Logit-KL & Token Agreement"]
-    G --> K["MMLU-tiny Evaluation"]
-    G --> L["VLM OCR Evaluation (CER, WER, EM)"]
-    H --> M["Throughput (tokens/sec)"]
-    H --> N["TTFT & TPOT Latency Profiling"]
-    H --> O["Context-Length Sweeps"]
-    I --> P["Incremental JSON Results File"]
-    J --> P
-    K --> P
-    L --> P
-    M --> P
-    N --> P
-    O --> P
-    P --> Q["report.py -> report.md + plots + verdicts"]
-    P --> R["Publish Metrics to W&B / TensorBoard"]
+    A["benchmark.py"] --> B["Load YAML Config"]
+    B --> C["Filter Models by GPU Arch (skip_on)"]
+    C --> D["Sequential Evaluation Loop (OOM-isolated)"]
+    D --> E{"Select Runtime"}
+    E -- "HuggingFace" --> F["PPL · MMLU · logit-KL · OCR"]
+    E -- "vLLM" --> G["Throughput · TTFT/TPOT"]
+    F --> H["Context sweeps · TurboQuant bit sweeps"]
+    G --> H
+    H --> I["Crash-safe JSON per (model, runtime)"]
+    I --> J["report.py → report.md + plots + verdicts"]
+    I --> K["W&B / TensorBoard"]
 ```
 
 ### Execution Backends & Schemes
@@ -269,13 +282,13 @@ graph TD
 |---|---|---|---|
 | `llm_compressor` | AWQ, GPTQ, PTQ, SmoothQuant | W4A16, W4A16_ASYM, W8A8, W8A16, FP8, FP8_DYNAMIC | `compressed-tensors` |
 | `modelopt` | AWQ, PTQ | W4A16, W8A16, W8A8, FP8, FP8_DYNAMIC, FP8_KV, NVFP4, MXFP4, MXFP6, MXFP8, MXINT8 | `modelopt` / `modelopt_fp4` |
-| `torchao` | PTQ (weight-only / dynamic) | W8A16, W4A16, W4A16_ASYM, W8A8, FP8, FP8_DYNAMIC | reload via `from_pretrained` (torchao installed) |
+| `torchao` | PTQ (weight-only / dynamic) | W8A16, W4A16, W4A16_ASYM, W8A8, FP8, FP8_DYNAMIC | reload via `from_pretrained` |
 
 ### Hardware Compatibility Floors
 
-* **INT4/INT8 (Marlin/AITER):** Turing+, Ampere, Ada, Hopper, CDNA3 — native.
-* **FP8 (E4M3/E5M2):** Ada/Hopper native; **emulated (slow) on Ampere** — see
-  [`docs/failure_cases.md`](docs/failure_cases.md#5-fp8-is-emulated-slow-on-ampere).
+* **INT4/INT8:** Turing+, Ampere, Ada, Hopper, CDNA3 — native.
+* **FP8 (E4M3/E5M2):** Ada/Hopper native. On Ampere the HF/torch path *emulates* it
+  (slow but runs); **vLLM refuses to load it** (`Minimum capability: 89`).
 * **NVFP4/MXFP4:** Blackwell native; MXFP4 emulated on Hopper; no path on Ampere.
 
 ---
@@ -293,32 +306,27 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
 # Core dependencies
 pip install "transformers>=4.51,<4.56" "datasets>=3,<4" accelerate pyyaml "pydantic>=2"
 
-# Backend 1: Neural Magic llmcompressor (base dependency)
+# Backend 1: llmcompressor (base dependency)
 pip install llmcompressor==0.6.0 compressed-tensors==0.10.2
 
 # Backend 2: NVIDIA ModelOpt (optional extra)
-pip install -e ".[modelopt]"        # or: pip install "nvidia-modelopt[torch]==0.44.0"
+pip install -e ".[modelopt]"
 
 # Backend 3: torchao (optional extra)
-pip install -e ".[torchao]"         # or: pip install torchao
+pip install -e ".[torchao]"
 
-# Evaluation and OCR metrics
+# Evaluation, tracking, plots
 pip install jiwer nltk pillow wandb matplotlib
 ```
 
 **vLLM lives in its own environment** — its pins drift out of sync with the quantization
-stack's on a different release cadence (see
-[`docs/failure_cases.md`](docs/failure_cases.md#7-vllm-needs-a-separate-environment-from-the-quantization-stack)).
-In a separate venv:
+stack's on a different release cadence. In a separate venv:
 
 ```bash
 pip install -e ".[vllm]"   # vllm>=0.10,<0.12
 ```
 
-`setup.bat` (Windows) / `setup.sh` (Linux) automate the primary quantization environment.
-`setup_hunyuan_venv.bat` builds a combined runtime+quantize environment for
-`trust_remote_code` VLM architectures that need a pinned transformers commit (documented
-inline in the script).
+`setup.bat` (Windows) / `setup.sh` (Linux) automate the primary environment.
 
 ---
 
@@ -327,93 +335,76 @@ inline in the script).
 ### 1. Quantize
 
 ```bash
-python quantize.py --config config/quantize/qwen3_1_7b/torchao_int8wo.yaml
+python quantize.py --config config/quantize/qwen3_1_7b/llmc_awq_w4a16.yaml
 ```
 
 Validates config, detects LLM vs VLM, auto-excludes vision-tower components from
-calibration, and saves to `{output_dir}/{model_name}-{backend}-{method}-{scheme}/`.
+calibration, and saves to `{output_dir}/{model}-{backend}-{method}-{scheme}/`.
 
 <details>
-<summary>Example config (llm_compressor GPTQ-W8A8)</summary>
+<summary>Example config</summary>
 
 ```yaml
-method: gptq
+method: awq
 backend: llm_compressor
 
 model:
-  model_id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  model_id: Qwen/Qwen3-1.7B
   torch_dtype: bfloat16
   device_map: auto
   model_type: llm
 
 scheme:
-  scheme: W8A8
+  scheme: W4A16
   group_size: 128
   symmetric: true
   observer: mse
-  per_channel: false
   targets: ["Linear"]
   ignore: ["lm_head"]
 
 calibration:
   dataset_name: HuggingFaceH4/ultrachat_200k
   split: train_sft
-  num_samples: 512
+  num_samples: 128
   max_seq_len: 2048
-  dataset_format: auto
 
 output:
-  output_dir: ./output
+  output_dir: ./outputs/qwen3-1.7b/awq-w4a16
   save_compressed: true
-  save_processor: true
-
-smoothquant:
-  enabled: true
-  strength: 0.5
-
-gptq:
-  dampening_frac: 0.01
 ```
 </details>
 
 ### 2. Smoke-test a checkpoint
 
 ```bash
-python tests/simple_generate.py --model ./output/TinyLlama-1.1B-Chat-v1.0-llm_compressor-gptq-W8A8
-python tests/simple_generate.py --model <quantized> --baseline TinyLlama/TinyLlama-1.1B-Chat-v1.0   # side-by-side
-python tests/simple_generate.py --model <quantized> --interactive                                    # chat
+python tests/simple_generate.py --model ./outputs/qwen3-1.7b/awq-w4a16/<subdir>
+python tests/simple_generate.py --model <quantized> --baseline Qwen/Qwen3-1.7B
 ```
 
 ### 3. Benchmark
 
 ```bash
-python benchmark.py -c config/benchmark/qwen3_1_7b.yaml         # PPL, MMLU-tiny, latency, throughput, memory
-python benchmark.py -c config/benchmark/qwen2_5_vl_3b.yaml      # VLM OCR: CER, WER, EM, BLEU
-python benchmark.py -c config/benchmark/qwen3_1_7b.yaml --dry-run   # validate config, no model load
+python benchmark.py -c config/benchmark/qwen3_1_7b_leaderboard.yaml   # full comparison
+python benchmark.py -c config/benchmark/qwen3_1_7b_tq_quality.yaml    # TQ quality vs context
+python benchmark.py -c config/benchmark/qwen3_1_7b.yaml --dry-run     # validate only
 ```
 
-HF runtime computes logits-dependent quality metrics (PPL, logit-KL, token agreement) and
-VLM OCR metrics; vLLM runtime profiles production performance (TTFT, TPOT, batch
-scaling, context sweeps). Results save incrementally as JSON
-(`results/<run_name>/`); when `tracking.enabled` includes `wandb`/`tensorboard`, results
-also publish there.
+Results save incrementally as JSON to `results/<run_name>/`, with a full environment
+snapshot (GPU, driver, CUDA, torch, git commit) in every file.
 
 ### 4. Report
 
 ```bash
-python report.py --dir results/<run_name>
+python report.py --dir results/<run_name>                        # report.md + plots + verdicts
+python scripts/mmlu_significance.py --dir results/<run_name>     # paired McNemar test
+python scripts/wandb_leaderboard.py --dir results/<run_name>     # consolidated W&B view
 ```
-
-Turns a results directory into `report.md` (leaderboard + environment provenance +
-BEST-FOR verdicts + embedded charts) + `plots/*.png` + `summary.json`. Auto-picks the
-latest sweep in the directory unless `--summary <path>` is given.
 
 ### 5. Serve
 
 ```bash
-vllm serve ./output/TinyLlama-W8A8 --quantization compressed-tensors      # llm_compressor
-vllm serve ./output/Qwen2.5-VL-7B-FP8 --quantization modelopt             # ModelOpt FP8 (Hopper/Ada)
-vllm serve ./output/model-nvfp4 --quantization modelopt_fp4               # ModelOpt NVFP4 (Blackwell)
+vllm serve ./outputs/qwen3-1.7b/awq-w4a16/<subdir> --quantization compressed-tensors
+vllm serve ./outputs/<model>-FP8 --quantization modelopt          # needs sm_89+
 ```
 
 ---
@@ -442,51 +433,43 @@ picks it up automatically.
 
 ## Roadmap
 
-**v1.0 is closed.** [`docs/v1_retrospective.md`](docs/v1_retrospective.md) is the
-post-mortem: why the project started, the four findings that survive scrutiny, the four
-claims that turned out wrong and how they were caught, and what's worth doing next.
-[`docs/v2_checklist.md`](docs/v2_checklist.md) is the audited list of what's still
-missing — the serving-SLA harness (3 of 4 phases unbuilt), two stubbed metrics, and two
-model families that have never been run.
-
-**Write-ups:** [`docs/blog/`](docs/blog/) — three posts from these results, with figures
-generated from the committed JSON.
-
-### Shipped (v1.0)
+### Shipped (v1)
 
 * Pydantic-validated config, registry-based quantizer/runtime dispatch
-* Three quantization backends (`llm_compressor`, `modelopt`, `torchao`) + fp16 baseline
+* Three quantization backends + fp16 baseline
 * Modality-aware calibration (automatic vision-tower exclusion for VLMs)
-* Crash-safe dual-runtime benchmark harness — PPL, MMLU-tiny, OCR (CER/WER/EM/BLEU),
-  TTFT/TPOT, throughput, context-length sweeps, TurboQuant bit-width sweeps
-* TurboQuant KV-cache compression (PyTorch reference), HF `generate` integration
-* W&B + TensorBoard tracking, environment-metadata provenance on every result
-* Report generator (`report.py`) — leaderboard, verdicts, charts from raw results
-* Windows VRAM-oversubscription measurement guard (see
-  [`docs/failure_cases.md`](docs/failure_cases.md))
+* Crash-safe dual-runtime benchmark harness — PPL, MMLU (with per-question detail and
+  paired significance testing), OCR, TTFT/TPOT, throughput, context sweeps, TurboQuant
+  bit-width sweeps
+* TurboQuant KV-cache compression (PyTorch reference) with HF `generate` integration
+* W&B + TensorBoard tracking, environment provenance on every result
+* Report generator, statistical-significance tooling
+* Windows VRAM-oversubscription measurement guard
 
-### v2 scope (parking lot — not started)
+### v2 backlog
 
-Each of these is deferred with a reason, not forgotten:
+Ordered by value; each is a real gap, not a wish.
 
-* **TurboQuant Triton kernels** — fused MSE/QJL score + fused decode. Designed
-  ([`notes/turboquant.md`](notes/turboquant.md) §5), not built. Current numbers all run
-  on the 5-10x-slower unfused reference.
-* **TurboQuant × vLLM** — a draft adapter existed but never imported cleanly; removed
-  in cleanup (git history has it). Real integration is a fresh build, not a revival.
-* **Per-channel key quantization** (KIVI-style) — the real fix for TurboQuant's low-bit
-  key fidelity, per [`docs/failure_cases.md`](docs/failure_cases.md#2-turboquants-default-k3v2-has-weak-next-token-agreement-at-low-bit-widths).
-  A quantizer redesign, not a wiring change.
-* **TensorRT-LLM / ONNX Runtime engines** — no supported path on this project's
-  hardware/OS (RTX 3060, Windows); would need infrastructure this repo doesn't have
-  access to validate.
-* **More quantizers** (GPTQ-variants beyond llm_compressor's, HQQ, BitsAndBytes) — only
-  worth adding if they'd let someone make a comparison they can't make today; see the
-  project's own [feature-gate question](notes/plan_v1.0.md).
-* **Pruning, sparsity, distillation** — different problem class (removes parameters
-  rather than compressing them); out of scope for a quantization comparison platform.
-* **Downstream-task evals beyond MMLU-tiny** (GSM8K, HumanEval) — schema support exists
-  in `MetricsConfig`, not wired into the benchmark loop yet.
+1. **Wire `logit_kl` + `token_agree`** — the functions exist and work; only the baseline
+   capture loop is missing. They're the right metrics for weight quantization (paired,
+   per-token, far more sensitive than MMLU accuracy).
+2. **Production serving metrics** — every latency number here is single-request
+   closed-loop. Missing: ITL distribution, E2E percentiles, async open-loop load harness
+   with Poisson arrivals, **goodput**, QPS sweep and saturation knee.
+3. **Run the untested model families** — configs exist and validate for
+   Qwen3-4B-Thinking and HunyuanOCR but have never been executed. The 4B family also
+   tests whether the "+15.4 PPL from 4-bit" result is small-model-specific.
+4. **Weight-quant quality vs context length** — unmeasured. PPL uses fixed-size chunks,
+   MMLU prompts are short. The same blind spot that produced this project's largest
+   correction, unexamined for weight quantization.
+5. **Per-channel key quantization (KIVI-style)** — the identified fix for TurboQuant's
+   low-bit collapse; would move K3V2 from unusable toward shippable.
+6. **TurboQuant Triton kernels** — fused MSE score and fused decode with online softmax.
+   Converts the banked memory win into a latency win.
+7. **TurboQuant × vLLM** — needs a real attention backend; without it TQ can't be
+   measured on the runtime where quantization actually performs.
+8. **FP8 / NVFP4 / TensorRT-LLM on Ada+ hardware** — checkpoints are correct; the GPU is
+   the only blocker.
 
 ---
 

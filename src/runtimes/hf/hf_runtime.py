@@ -1350,7 +1350,7 @@ class HFRuntime(RuntimeBase):
             # The window size is the sample size of every agreement figure below. At the
             # old hardcoded 64 the binomial SE was ~5pp, which made the whole
             # accuracy-vs-context-length axis unreadable: apparent trends across L were
-            # smaller than their own error bars (see docs/failure_cases.md #10).
+            # smaller than their own error bars.
             compare = min(compare_positions, L - ring_capacity)
             try:
                 with torch.no_grad():

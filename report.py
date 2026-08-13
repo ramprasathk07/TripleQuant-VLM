@@ -10,7 +10,7 @@ built from whichever of those the run actually collected.
 Usage:
     python report.py --dir results/qwen3-1.7b-sweep
     python report.py --dir results/qwen3-1.7b-sweep --summary results/qwen3-1.7b-sweep/comparison_summary_20260717T150027Z.json
-    python report.py --dir results/qwen3-1.7b-sweep --out docs/benchmark_report
+    python report.py --dir results/qwen3-1.7b-sweep --out reports/qwen3-1.7b
 """
 from __future__ import annotations
 

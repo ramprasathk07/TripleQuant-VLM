@@ -45,7 +45,7 @@ class TorchAOQuantizer(BaseQuantizer):
         gs = self.config.scheme.group_size
         # TILE_PACKED_TO_4D: the only int4 packing format that runs on this
         # torchao 0.17 / sm_86 stack — PLAIN/PRESHUFFLED need the uninstallable
-        # 'mslk' kernel package (see docs/qwen3_1_7b_leaderboard.md).
+        # 'mslk' kernel package, which has no installable release.
         _int4 = lambda: Int4WeightOnlyConfig(
             group_size=gs, int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D)
         builders = {
